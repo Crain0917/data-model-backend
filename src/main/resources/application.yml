@@ -1,0 +1,60 @@
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+
+spring:
+  application:
+    name: data-model-backend
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+  datasource:
+    # 元数据库（MySQL 8）。凭据只从环境变量注入，禁止写入配置文件。
+    url: jdbc:mysql://${DB_HOST:192.168.10.11}:${DB_PORT:3306}/${DB_NAME:data_model}?useUnicode=true&characterEncoding=utf8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai
+    username: ${DB_USER:data_model}
+    password: ${DB_PASSWORD:Srcloud@216}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      pool-name: data-model-hikari
+      maximum-pool-size: ${DB_POOL_MAX:10}
+      minimum-idle: ${DB_POOL_MIN:2}
+      connection-timeout: 5000
+      validation-timeout: 3000
+  sql:
+    init:
+      # 生产库表结构由运维执行 项目管理/架构/schema.sql，应用不自动建表
+      mode: never
+  mvc:
+    # 未匹配路由交由 GlobalExceptionHandler 统一返回 404/4002，而非默认错误页
+    throw-exception-if-no-handler-found: true
+  web:
+    resources:
+      add-mappings: false
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+    # 不打印 SQL 参数，避免敏感信息落日志
+    log-impl: org.apache.ibatis.logging.nologging.NoLoggingImpl
+  global-config:
+    banner: false
+    db-config:
+      id-type: auto
+
+app:
+  security:
+    # AES-256-GCM 密钥：32 字节，支持 base64 或 32 字符原文；必填，启动时校验
+    aes-key: ${AES_KEY:MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
+  schema-cache:
+    ttl-seconds: ${SCHEMA_CACHE_TTL_SECONDS:300}
+  data-source:
+    connect-timeout-ms: ${DS_CONNECT_TIMEOUT_MS:5000}
+    query-timeout-seconds: ${DS_QUERY_TIMEOUT_SECONDS:10}
+  cors:
+    allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173,http://127.0.0.1:5173}
+
+logging:
+  level:
+    root: info
+    com.datamodel: info
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"
