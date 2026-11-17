@@ -31,3 +31,18 @@ CREATE TABLE IF NOT EXISTS data_model_schema_cache (
   update_time    DATETIME     NOT NULL,
   CONSTRAINT uk_schema_cache UNIQUE (data_source_id, table_name)
 );
+
+CREATE TABLE IF NOT EXISTS data_model_sink_watermark (
+  id               BIGINT AUTO_INCREMENT PRIMARY KEY,
+  flow_id          BIGINT       NOT NULL,
+  node_id          VARCHAR(64)  NOT NULL,
+  target_key       VARCHAR(200) NOT NULL,
+  watermark_column VARCHAR(64),
+  last_value       VARCHAR(512),
+  last_value_type  VARCHAR(32),
+  last_rowid       BIGINT,
+  committed_rows   BIGINT       NOT NULL DEFAULT 0,
+  create_time      DATETIME     NOT NULL,
+  update_time      DATETIME     NOT NULL,
+  CONSTRAINT uk_sink_watermark UNIQUE (flow_id, node_id, target_key)
+);

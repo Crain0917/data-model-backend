@@ -19,6 +19,9 @@ spring:
       minimum-idle: ${DB_POOL_MIN:2}
       connection-timeout: 5000
       validation-timeout: 3000
+      # 均小于 MySQL wait_timeout(28800s)，避免空闲连接被服务端/网络设备回收后首次请求失败
+      max-lifetime: ${DB_MAX_LIFETIME_MS:1800000}
+      keepalive-time: ${DB_KEEPALIVE_MS:60000}
   sql:
     init:
       # 生产库表结构由运维执行 项目管理/架构/schema.sql，应用不自动建表
@@ -44,6 +47,18 @@ app:
   security:
     # AES-256-GCM 密钥：32 字节，支持 base64 或 32 字符原文；必填，启动时校验
     aes-key: ${AES_KEY:MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
+  doris:
+    # 计算层（Doris FE）。用户名必填、密码可为空；凭据只从环境变量注入。
+    host: ${DORIS_HOST:192.168.10.11}
+    http-port: ${DORIS_HTTP_PORT:8040}
+    query-port: ${DORIS_QUERY_PORT:9030}
+    user: ${DORIS_USER:data_model}
+    password: ${DORIS_PASSWORD:Srcloud@216}
+    schema: ${DORIS_SCHEMA:data_model}
+    batch-rows: ${DORIS_BATCH_ROWS:100000}
+    timeout-seconds: ${DORIS_TIMEOUT_SECONDS:600}
+    retry-times: ${DORIS_RETRY_TIMES:2}
+    init-registry-tables: ${DORIS_INIT_REGISTRY_TABLES:true}
   schema-cache:
     ttl-seconds: ${SCHEMA_CACHE_TTL_SECONDS:300}
   data-source:

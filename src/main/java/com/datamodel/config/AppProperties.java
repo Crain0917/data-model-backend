@@ -57,6 +57,8 @@ public class AppProperties {
         private int connectTimeoutMs = 5000;
         /** 被测数据源查询超时（秒）。 */
         private int queryTimeoutSeconds = 10;
+        /** 节点数据预览查询超时（秒）。 */
+        private int previewQueryTimeoutSeconds = 30;
 
         public int getConnectTimeoutMs() {
             return connectTimeoutMs;
@@ -72,6 +74,14 @@ public class AppProperties {
 
         public void setQueryTimeoutSeconds(int queryTimeoutSeconds) {
             this.queryTimeoutSeconds = queryTimeoutSeconds;
+        }
+
+        public int getPreviewQueryTimeoutSeconds() {
+            return previewQueryTimeoutSeconds;
+        }
+
+        public void setPreviewQueryTimeoutSeconds(int previewQueryTimeoutSeconds) {
+            this.previewQueryTimeoutSeconds = previewQueryTimeoutSeconds;
         }
     }
 

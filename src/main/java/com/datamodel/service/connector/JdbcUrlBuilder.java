@@ -26,12 +26,19 @@ public class JdbcUrlBuilder {
     }
 
     public String build(DataSourceEntity ds) {
+        return build(ds, null);
+    }
+
+    /**
+     * @param queryTimeoutSecondsOverride 非空时覆盖 socketTimeout（预览等长查询场景）
+     */
+    public String build(DataSourceEntity ds, Integer queryTimeoutSecondsOverride) {
         Map<String, String> extra = parseExtraParams(ds.getExtraParams());
         String type = ds.getType() == null ? "" : ds.getType().toUpperCase();
         switch (type) {
             case "MYSQL":
             case "DORIS":
-                return buildMysqlProtocolUrl(ds, extra);
+                return buildMysqlProtocolUrl(ds, extra, queryTimeoutSecondsOverride);
             case "DM8":
                 return buildDmUrl(ds, extra);
             default:
@@ -39,7 +46,8 @@ public class JdbcUrlBuilder {
         }
     }
 
-    private String buildMysqlProtocolUrl(DataSourceEntity ds, Map<String, String> extra) {
+    private String buildMysqlProtocolUrl(DataSourceEntity ds, Map<String, String> extra,
+                                         Integer queryTimeoutSecondsOverride) {
         Map<String, String> params = new LinkedHashMap<>();
         params.put("useUnicode", "true");
         params.put("characterEncoding", "utf8");
@@ -47,8 +55,18 @@ public class JdbcUrlBuilder {
         params.put("allowPublicKeyRetrieval", "true");
         params.put("serverTimezone", "Asia/Shanghai");
         params.put("connectTimeout", String.valueOf(appProperties.getDataSource().getConnectTimeoutMs()));
-        params.put("socketTimeout", String.valueOf(appProperties.getDataSource().getQueryTimeoutSeconds() * 1000L));
+        int socketTimeout = queryTimeoutSecondsOverride != null
+                ? queryTimeoutSecondsOverride
+                : appProperties.getDataSource().getQueryTimeoutSeconds();
+        params.put("socketTimeout", String.valueOf(socketTimeout * 1000L));
+        // 服务端游标分批读取，避免大表全量加载进内存。
+        params.put("useCursorFetch", "true");
+        params.put("defaultFetchSize", "1000");
         params.putAll(extra);
+        // httpPort 只用于 Stream Load，不是 MySQL 协议参数。
+        if ("DORIS".equalsIgnoreCase(ds.getType())) {
+            params.remove("httpPort");
+        }
         return "jdbc:mysql://" + ds.getHost() + ":" + ds.getPort() + "/" + ds.getDefaultDb()
                 + "?" + toQuery(params);
     }

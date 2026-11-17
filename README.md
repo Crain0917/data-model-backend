@@ -1,6 +1,6 @@
 # 可视化数据集成平台 · 后端（data-model-backend）
 
-Spring Boot 单体后端。当前版本完成 **M1 数据源域**：数据源 CRUD、连通性测试、表/字段元数据查询；执行引擎、DAG、SQL 编排、WebSocket 在后续里程碑实现。
+Spring Boot 单体后端。已完成 **M1 数据源域**（CRUD、连通性测试、表/字段元数据查询）与 **M3 编排与物理化**（任务 CRUD、DAG 校验、节点 SQL 预览、MySQL/Doris/DM8 → Doris 类型映射、Stream Load 同步与中间表物化）。WebSocket 进度推送尚未实现，前端通过轮询执行记录获取状态。
 
 - 元数据库：MySQL 8+（生产使用服务器 `data_model` 库）
 - 计算库：Doris（MySQL 协议，默认 9030）
@@ -70,6 +70,16 @@ data-model-backend/
 | `DS_CONNECT_TIMEOUT_MS` | 否 | `5000` | 被测数据源连接超时（毫秒） |
 | `DS_QUERY_TIMEOUT_SECONDS` | 否 | `10` | 被测数据源查询超时（秒） |
 | `CORS_ALLOWED_ORIGINS` | 否 | `http://localhost:5173,http://127.0.0.1:5173` | 前端来源白名单，逗号分隔 |
+| `DORIS_HOST` | 否 | `192.168.10.11` | Doris FE 主机 |
+| `DORIS_HTTP_PORT` | 否 | `8040` | Stream Load HTTP 端口 |
+| `DORIS_QUERY_PORT` | 否 | `9030` | Doris MySQL 协议端口 |
+| `DORIS_USER` | 是（物化时） | 无 | Doris 账号；未设置时预览仍可用，执行报 `5002` |
+| `DORIS_PASSWORD` | 否 | 空 | Doris 密码（内网可空） |
+| `DORIS_SCHEMA` | 否 | `data_model` | 物化表所在 schema |
+| `DORIS_BATCH_ROWS` | 否 | `100000` | 单次 Stream Load 行数上限 |
+| `DORIS_TIMEOUT_SECONDS` | 否 | `600` | Stream Load 超时（秒） |
+| `DORIS_RETRY_TIMES` | 否 | `2` | 失败重试次数 |
+| `DORIS_INIT_REGISTRY_TABLES` | 否 | `true` | 是否幂等创建 M3 两张协调表 |
 
 生成密钥：
 
@@ -163,6 +173,25 @@ java -jar target/data-model-backend.jar --spring.profiles.active=local
 | POST | `/api/data-source/{id}/test` | 测试连接（JDBC `SELECT 1`） |
 | GET | `/api/data-source/{id}/tables` | 表列表 |
 | GET | `/api/data-source/{id}/tables/{table}/columns` | 字段列表 |
+
+任务与执行接口（v1 契约 §3）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/flow?keyword=&page=&size=` | 任务列表 |
+| POST | `/api/flow` | 新建任务，返回 `{id}` |
+| GET | `/api/flow/{id}` | 任务详情（含 `dagJson`） |
+| PUT | `/api/flow/{id}/dag` | 保存画布；环/自环/入线校验失败返回 `4001 {nodeId,reason}` |
+| DELETE | `/api/flow/{id}` | 删除任务（清理 `node_field`，保留执行历史） |
+| POST | `/api/flow/{id}/run` | 异步执行整任务，返回 202 `{runId}`；已有 RUNNING 返回 `4005` |
+| POST | `/api/flow/{id}/node/{nodeId}/run` | 异步执行单节点（含上游），返回 202 `{runId}` |
+| POST | `/api/flow/{id}/node/{nodeId}/sql` | **SQL 预览**，返回 `{sql,params,displaySql,dialect,upstreamMissing}` |
+| GET | `/api/flow/{id}/runs?page=&size=` | 执行记录列表 |
+| GET | `/api/flow-run/{runId}` | 一次执行详情（按拓扑顺序返回节点） |
+| GET | `/api/flow-run/{runId}/node/{nodeId}/logs` | 节点 SQL、参数化 SQL 与逐行日志 |
+
+SQL 预览请求体可选：`{ "dialect": "DORIS", "dagJson": { ... } }`；不传 `dagJson` 时读取已保存画布。
+`sql` 为参数化版本（唯一可执行），`displaySql` 仅供展示，`upstreamMissing` 为尚未物化的上游节点 ID。
 
 业务错误码：
 
@@ -299,34 +328,25 @@ Doris 表/字段分别使用 `SHOW TABLES`、`SHOW COLUMNS`。
 - 统一异常处理不向客户端返回堆栈。
 - CORS 仅放行配置的前端来源。
 
-## 9. 测试与验证结果
+## 9. 测试
 
 ```bash
 mvn test
 ```
 
-27 个用例全部通过：AES-GCM 加解密/篡改检测、JDBC URL 构建与参数转义、错误分类、H2 元数据读取、MockMvc 接口测试（CRUD、密码不回显、空密码保留、4002/4003/4004/4000、删除清缓存、未定义路由 404、错误方法 405）。
+M3 单测 26 个全部通过：
 
-已在服务器环境完成真实链路验证：
+- `TypeMappingRegistryTest`：MySQL / Oracle / DM8 → Doris 4.1.3 全矩阵（无符号整数、DECIMAL 精度、DATETIME/V2、TIMESTAMP/TIME、CLOB/BLOB/RAW、ENUM/SET、BIT、未知类型兜底）。
+- `DorisNameSanitizerTest`：`dm_src_` / `dm_mid_` 命名、非法字符折叠、超长截断 + 稳定 MD5、列名清洗。
+- `SqlBuilderFactoryTest`：空投影、嵌套 AND/OR 参数化、Join in-0/in-1、Union 缺列补 NULL、上游缺失、GroupBy 全局聚合、输出列类型推断。
 
-- MySQL 元数据库测试连接成功（约 10–15ms），7 张表，字段读取正常
-- Doris 测试连接成功（约 17–91ms），表 `orders` / `orders_bak` / `users`，字段读取正常
-- 不可达地址返回 HTTP 400 + `code=4004`，`errorType=REFUSED`，无 500 堆栈
-- 库中 `password_enc` 为 `v1:` 前缀密文，响应与运行日志均无明文密码
-- 删除数据源后元数据缓存同步清理
+真实链路验证（MySQL `testdb` → Doris `data_model`，Stream Load 两次执行）结果见交付说明；验证用表在完成后已清理。
 
 ## 10. 已知问题与未完成项
 
-1. **演示数据 `doris_demo` 已通过接口重存密码**（2026-11-13）：换用新的 `AES_KEY` 后原密文无法解密，已用 `PUT /api/data-source/1` 重新加密保存，现测试连接、表/字段查询均正常。**`AES_KEY` 必须保持稳定**，再次更换需按同样方式重存所有数据源密码。
-2. **DM8 未连真实实例验证**：驱动已打包，元数据读取使用 `DatabaseMetaData` 实现；需达梦测试库补验。
-3. **物理表与设计 DDL 不一致**：详见第 5 节，待架构师统一。
-4. 执行引擎、DAG 校验、SQL 构建、任务调度、WebSocket 推送尚未实现（M3–M5）。
-5. 登录鉴权、操作审计未实现（v1 规划默认无登录）。
-
-## 11. 后续接口占位
-
-`engine/`、`sql/` 包已预留，M3–M4 将实现：
-
-- 流程定义/画布保存与 DAG 校验（4001）
-- 单节点执行与预览、执行记录（4005 / 4006 / 5001）
-- MySQL / Doris / DM8 到 Doris 的 SQL 生成与调度
+1. **`AES_KEY` 必须保持稳定**：更换后已存数据源密码无法解密，需逐个重新录入密码。
+2. **DM8 / Oracle 未连真实实例验证**：类型映射与 JDBC 读取已实现并有单测，真实库同步待补验。
+3. **物理表与设计 DDL 不一致**：详见第 5 节；M3 新增的 `data_model_table_registry`、`data_model_sync_log` 见 `docs/schema-m3.sql`，应用只幂等建新表，不改既有表。
+4. **WebSocket 进度推送未实现**：执行状态通过 `GET /api/flow-run/{runId}` 轮询。
+5. **节点数据预览（§3.8）未实现**：v1 先提供 SQL 预览 `/sql` 与执行结果行数。
+6. 登录鉴权、操作审计未实现（v1 规划默认无登录）。

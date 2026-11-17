@@ -38,11 +38,18 @@ public class JdbcConnector {
 
     public Connection openConnection(DataSourceEntity ds, String plainPassword)
             throws SQLException, ClassNotFoundException {
+        return openConnection(ds, plainPassword, null);
+    }
+
+    /** @param queryTimeoutSecondsOverride 非空时覆盖 JDBC socketTimeout（预览等长查询场景） */
+    public Connection openConnection(DataSourceEntity ds, String plainPassword,
+                                     Integer queryTimeoutSecondsOverride)
+            throws SQLException, ClassNotFoundException {
         Class.forName(DriverResolver.driverClass(ds.getType()));
         Properties props = new Properties();
         props.setProperty("user", ds.getUsername() == null ? "" : ds.getUsername());
         props.setProperty("password", plainPassword == null ? "" : plainPassword);
-        return DriverManager.getConnection(urlBuilder.build(ds), props);
+        return DriverManager.getConnection(urlBuilder.build(ds, queryTimeoutSecondsOverride), props);
     }
 
     public TestConnectionResult test(DataSourceEntity ds, String plainPassword) {
@@ -109,6 +116,98 @@ public class JdbcConnector {
             throw new BizException(ErrorCode.PARAM_ERROR, "表名不合法，仅支持字母、数字、下划线、$");
         }
         return table;
+    }
+
+    /** Sink 目标表是否存在（MySQL/Doris 用 catalog，Oracle/DM8 用 schema）。 */
+    public boolean tableExists(Connection connection, DataSourceEntity ds, String table) throws SQLException {
+        String safeTable = validateTableName(table);
+        DatabaseMetaData metaData = connection.getMetaData();
+        String catalog = catalogOf(ds);
+        for (String schema : candidateSchemas(ds)) {
+            for (String candidate : candidateNames(safeTable)) {
+                try (ResultSet rs = metaData.getTables(catalog, schema, candidate,
+                        new String[]{"TABLE"})) {
+                    if (rs.next()) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Sink 目标表列与类型；找不到返回空。 */
+    public List<ColumnInfo> describeColumns(Connection connection, DataSourceEntity ds, String table)
+            throws SQLException {
+        String safeTable = validateTableName(table);
+        DatabaseMetaData metaData = connection.getMetaData();
+        String catalog = catalogOf(ds);
+        for (String schema : candidateSchemas(ds)) {
+            for (String candidate : candidateNames(safeTable)) {
+                List<ColumnInfo> columns = new ArrayList<>();
+                try (ResultSet rs = metaData.getColumns(catalog, schema, candidate, "%")) {
+                    while (rs.next()) {
+                        String typeName = rs.getString("TYPE_NAME");
+                        int size = rs.getInt("COLUMN_SIZE");
+                        int digits = rs.getInt("DECIMAL_DIGITS");
+                        columns.add(new ColumnInfo(rs.getString("COLUMN_NAME"),
+                                formatJdbcType(typeName, size, digits)));
+                    }
+                }
+                if (!columns.isEmpty()) {
+                    return columns;
+                }
+            }
+        }
+        return new ArrayList<>();
+    }
+
+    private static String catalogOf(DataSourceEntity ds) {
+        String type = ds.getType() == null ? "" : ds.getType().toUpperCase();
+        if ("MYSQL".equals(type) || "DORIS".equals(type)) {
+            return ds.getDefaultDb();
+        }
+        return null;
+    }
+
+    private static List<String> candidateSchemas(DataSourceEntity ds) {
+        List<String> schemas = new ArrayList<>();
+        String type = ds.getType() == null ? "" : ds.getType().toUpperCase();
+        String db = ds.getDefaultDb();
+        if (db != null && !db.trim().isEmpty()
+                && ("ORACLE".equals(type) || "DM8".equals(type))) {
+            schemas.add(upper(db));
+            schemas.add(db);
+        }
+        schemas.add(null);
+        return schemas;
+    }
+
+    private static List<String> candidateNames(String table) {
+        List<String> names = new ArrayList<>();
+        names.add(table);
+        if (!names.contains(table.toUpperCase())) {
+            names.add(table.toUpperCase());
+        }
+        if (!names.contains(table.toLowerCase())) {
+            names.add(table.toLowerCase());
+        }
+        return names;
+    }
+
+    private static String formatJdbcType(String typeName, int size, int digits) {
+        if (typeName == null) {
+            return "";
+        }
+        String upper = typeName.toUpperCase();
+        if ((upper.contains("CHAR") || upper.contains("VARCHAR")) && size > 0) {
+            return typeName + "(" + size + ")";
+        }
+        if ((upper.contains("DECIMAL") || upper.contains("NUMERIC") || upper.equals("NUMBER"))
+                && size > 0) {
+            return typeName + "(" + size + (digits > 0 ? "," + digits : "") + ")";
+        }
+        return typeName;
     }
 
     private List<TableInfo> listDmTables(Connection connection, String schema) throws SQLException {
