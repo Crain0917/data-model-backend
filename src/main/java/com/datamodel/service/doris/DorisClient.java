@@ -23,8 +23,12 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.Locale;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Doris FE 访问层：JDBC（9030）执行 DDL/DML，HTTP（8040）走 Stream Load。
@@ -33,6 +37,8 @@ import java.util.List;
 public class DorisClient {
 
     private static final Logger log = LoggerFactory.getLogger(DorisClient.class);
+    private static final Pattern KEY_MODEL = Pattern.compile(
+            "\\b(UNIQUE|DUPLICATE|AGGREGATE)\\s+KEY\\s*\\(([^)]*)\\)", Pattern.CASE_INSENSITIVE);
 
     private final DorisProperties props;
     private final ObjectMapper objectMapper;
@@ -98,6 +104,25 @@ public class DorisClient {
         public String describe() {
             String label = name == null || name.trim().isEmpty() ? "platform" : name.trim();
             return "DORIS[" + label + "]@" + host + ":" + httpPort + ":" + database;
+        }
+    }
+
+    /** SHOW CREATE TABLE 解析结果：数据模型与 KEY 列（保持表内顺序）。 */
+    public static final class TableMeta {
+        private final String model;
+        private final List<String> keyColumns;
+
+        TableMeta(String model, List<String> keyColumns) {
+            this.model = model;
+            this.keyColumns = keyColumns;
+        }
+
+        public String getModel() {
+            return model;
+        }
+
+        public List<String> getKeyColumns() {
+            return keyColumns;
         }
     }
 
@@ -241,6 +266,39 @@ public class DorisClient {
             throw new BizException(ErrorCode.DORIS_EXEC_FAILED,
                     "查询 Doris 表结构失败：" + safeMessage(e));
         }
+    }
+
+    /** 读取目标表实际建表模型与 KEY 列，用于配置与已有表的一致性校验。 */
+    public TableMeta describeTableModel(DorisEndpoint endpoint, String table) {
+        String sql = "SHOW CREATE TABLE " + qualifiedQuoted(endpoint, table);
+        String ddl;
+        try (Connection c = open(endpoint); Statement st = c.createStatement()) {
+            st.setQueryTimeout(props.getTimeoutSeconds());
+            try (ResultSet rs = st.executeQuery(sql)) {
+                ddl = rs.next() ? rs.getString(2) : "";
+            }
+        } catch (SQLException e) {
+            throw new BizException(ErrorCode.DORIS_EXEC_FAILED,
+                    "读取 Doris 表模型失败：" + safeMessage(e));
+        }
+        return parseTableMeta(ddl);
+    }
+
+    static TableMeta parseTableMeta(String ddl) {
+        if (ddl != null) {
+            Matcher matcher = KEY_MODEL.matcher(ddl);
+            if (matcher.find()) {
+                List<String> keys = new ArrayList<>();
+                for (String part : matcher.group(2).split(",")) {
+                    String key = part.replace("`", "").replace("\"", "").trim();
+                    if (!key.isEmpty()) {
+                        keys.add(key);
+                    }
+                }
+                return new TableMeta(matcher.group(1).toUpperCase(Locale.ROOT), keys);
+            }
+        }
+        return new TableMeta(null, new ArrayList<>());
     }
 
     /** 平台 Doris 中指定前缀的表名（用于保存画布时对账清理 dm_mid_*）。 */

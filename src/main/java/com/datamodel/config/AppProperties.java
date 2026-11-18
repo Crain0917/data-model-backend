@@ -87,7 +87,7 @@ public class AppProperties {
 
     public static class Cors {
         /** 允许的前端来源，逗号分隔。 */
-        private String allowedOrigins = "http://localhost:5173,http://127.0.0.1:5173";
+        private String allowedOrigins = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5175,http://127.0.0.1:5175";
 
         public String getAllowedOrigins() {
             return allowedOrigins;

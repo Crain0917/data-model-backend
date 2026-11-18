@@ -267,9 +267,49 @@ public final class TargetTypeMapper {
         return idx > 0 ? type.substring(idx) : "(38,10)";
     }
 
+    /**
+     * 去修饰符并加宽无符号整型；目标库 DDL 中不得出现 UNSIGNED/ZEROFILL。
+     * 加宽规则与 {@code TypeMappingRegistry.normalizeDorisType} 一致。
+     */
     private static String normalizeDoris(String type) {
-        return type == null || type.trim().isEmpty()
-                ? "STRING" : type.trim().toUpperCase(Locale.ROOT);
+        if (type == null || type.trim().isEmpty()) {
+            return "STRING";
+        }
+        String t = type.trim().replaceAll("\\s+", " ").toUpperCase(Locale.ROOT);
+        boolean unsigned = t.matches(".*\\bUNSIGNED\\b.*");
+        if (unsigned || t.matches(".*\\bZEROFILL\\b.*")) {
+            t = t.replaceAll("\\bUNSIGNED\\b", "")
+                    .replaceAll("\\bZEROFILL\\b", "")
+                    .replaceAll("\\s+", " ")
+                    .trim();
+            if (t.isEmpty()) {
+                return "STRING";
+            }
+            if (unsigned) {
+                String widened = widenUnsigned(baseDoris(t));
+                if (widened != null) {
+                    return widened;
+                }
+            }
+        }
+        return t;
+    }
+
+    private static String widenUnsigned(String base) {
+        switch (base) {
+            case "TINYINT":
+                return "SMALLINT";
+            case "SMALLINT":
+            case "MEDIUMINT":
+                return "INT";
+            case "INT":
+            case "INTEGER":
+                return "BIGINT";
+            case "BIGINT":
+                return "LARGEINT";
+            default:
+                return null;
+        }
     }
 
     private static String baseDoris(String type) {

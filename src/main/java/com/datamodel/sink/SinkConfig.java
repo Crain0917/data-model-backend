@@ -9,6 +9,8 @@ public class SinkConfig {
     public static final String DORIS = "DORIS";
     public static final String APPEND = "APPEND";
     public static final String OVERWRITE = "OVERWRITE";
+    public static final String UNIQUE = "UNIQUE";
+    public static final String DUPLICATE = "DUPLICATE";
     public static final int DEFAULT_BATCH_SIZE = 10000;
     public static final int MIN_BATCH_SIZE = 100;
     public static final int MAX_BATCH_SIZE = 100000;
@@ -18,6 +20,12 @@ public class SinkConfig {
     private Long dataSourceId;
     private String tableName;
     private String writeMode = APPEND;
+    /** Doris 建表模型；缺省 DUPLICATE，兼容未配置该字段的旧 DAG。 */
+    private String tableModel = DUPLICATE;
+    /** tableModel 是否由用户显式配置（用于区分旧 DAG 与显式 Duplicate + 覆盖）。 */
+    private boolean tableModelExplicit;
+    /** UNIQUE 模型的主键目标列，顺序即建表键顺序。 */
+    private List<String> keyColumns = new ArrayList<>();
     private int batchSize = DEFAULT_BATCH_SIZE;
     private boolean autoCreateTable = true;
     private String watermarkColumn;
@@ -63,6 +71,34 @@ public class SinkConfig {
 
     public void setWriteMode(String writeMode) {
         this.writeMode = writeMode;
+    }
+
+    public String getTableModel() {
+        return tableModel;
+    }
+
+    public void setTableModel(String tableModel) {
+        this.tableModel = tableModel == null ? DUPLICATE : tableModel;
+    }
+
+    public boolean isTableModelExplicit() {
+        return tableModelExplicit;
+    }
+
+    public void setTableModelExplicit(boolean tableModelExplicit) {
+        this.tableModelExplicit = tableModelExplicit;
+    }
+
+    public List<String> getKeyColumns() {
+        return keyColumns;
+    }
+
+    public void setKeyColumns(List<String> keyColumns) {
+        this.keyColumns = keyColumns == null ? new ArrayList<>() : keyColumns;
+    }
+
+    public boolean isUniqueModel() {
+        return UNIQUE.equalsIgnoreCase(tableModel);
     }
 
     public int getBatchSize() {

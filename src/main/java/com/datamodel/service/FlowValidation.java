@@ -165,6 +165,7 @@ public final class FlowValidation {
     private static boolean isKnownType(String type) {
         return "source".equals(type) || "filter".equals(type) || "groupby".equals(type)
                 || "join".equals(type) || "union".equals(type) || "convert".equals(type)
+                || "calculator".equals(type) || "formula".equals(type)
                 || "sink".equals(type);
     }
 

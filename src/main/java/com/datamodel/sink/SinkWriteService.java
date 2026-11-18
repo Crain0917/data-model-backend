@@ -37,6 +37,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -172,10 +173,9 @@ public class SinkWriteService {
         DorisClient.DorisEndpoint target = dorisClient.endpointFor(ds, password);
         config.setTargetLabelOverride(target.describe() + "." + config.getTableName());
 
-        boolean hasSeqColumn;
+        List<ColumnInfo> targetColumns;
         try {
-            prepareDorisTarget(config, target, progress);
-            hasSeqColumn = hasSequenceColumn(target, config.getTableName());
+            targetColumns = prepareDorisTarget(config, target, progress);
             if (config.isOverwrite()) {
                 dorisClient.truncate(target, config.getTableName());
                 logSink.log("INFO", "覆盖写入：已清空目标表 " + config.targetLabel());
@@ -193,7 +193,7 @@ public class SinkWriteService {
         }
         progress.setSqlText("Stream Load → " + config.targetLabel());
         writeDorisRows(flowId, runId, node, config, target, plan, resume, watermark,
-                watermarkType, hasSeqColumn, logSink, result, progress);
+                watermarkType, targetColumns, logSink, result, progress);
         result.setSqlText("Stream Load → " + config.targetLabel());
     }
 
@@ -213,8 +213,15 @@ public class SinkWriteService {
                                 DorisClient.DorisEndpoint target,
                                 SinkSqlPlanner.SinkReadPlan plan, boolean resume,
                                 SinkWatermarkEntity watermark, String watermarkType,
-                                boolean hasSeqColumn, LogSink logSink, SinkWriteResult result,
-                                SinkProgress progress) {
+                                List<ColumnInfo> targetColumns, LogSink logSink,
+                                SinkWriteResult result, SinkProgress progress) {
+        List<String> targetColumnNames = new ArrayList<>();
+        for (ColumnInfo column : targetColumns) {
+            targetColumnNames.add(column.getName());
+        }
+        List<String> jsonPaths = dorisJsonPaths(config, targetColumnNames);
+        String[] bodyKeys = jsonBodyKeys(config, targetColumnNames);
+        boolean hasSeqColumn = hasSequenceColumn(targetColumns);
         int[] sourceIndexes = sourceIndexes(config, plan);
         int rowidIndex = plan.getReadColumns().indexOf(SinkSqlPlanner.ROWID_COLUMN);
         int watermarkIndex = watermarkIndex(config, plan);
@@ -248,7 +255,7 @@ public class SinkWriteService {
                         Object[] last = batch.get(batch.size() - 1);
                         String label = labelPrefix + "_" + batchNo;
                         int written = writeDorisBatch(config, target, batch, sourceIndexes,
-                                hasSeqColumn, seq, label, logSink);
+                                jsonPaths, bodyKeys, hasSeqColumn, seq, label, logSink);
                         rows += written;
                         committed += written;
                         seq += written;
@@ -272,7 +279,7 @@ public class SinkWriteService {
                     Object[] last = batch.get(batch.size() - 1);
                     String label = labelPrefix + "_" + batchNo;
                     int written = writeDorisBatch(config, target, batch, sourceIndexes,
-                            hasSeqColumn, seq, label, logSink);
+                            jsonPaths, bodyKeys, hasSeqColumn, seq, label, logSink);
                     rows += written;
                     committed += written;
                     seq += written;
@@ -299,10 +306,10 @@ public class SinkWriteService {
     }
 
     private int writeDorisBatch(SinkConfig config, DorisClient.DorisEndpoint target,
-                                List<Object[]> rows, int[] sourceIndexes,
-                                boolean hasSeqColumn, long seqBase, String label, LogSink logSink) {
-        List<String> jsonPaths = dorisJsonPaths(config, hasSeqColumn);
-        byte[] body = buildJsonBody(config, rows, sourceIndexes, hasSeqColumn, seqBase);
+                                List<Object[]> rows, int[] sourceIndexes, List<String> jsonPaths,
+                                String[] bodyKeys, boolean hasSeqColumn, long seqBase,
+                                String label, LogSink logSink) {
+        byte[] body = buildJsonBody(config, rows, sourceIndexes, bodyKeys, hasSeqColumn, seqBase);
         for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             try {
                 dorisClient.streamLoad(target, config.getTableName(), body, label, jsonPaths, 1800);
@@ -322,27 +329,48 @@ public class SinkWriteService {
         throw sinkWriteFailed(config, label, null);
     }
 
-    /** jsonpaths 按目标表物理列顺序映射，自动建表时隐藏键列在最前。 */
-    static List<String> dorisJsonPaths(SinkConfig config, boolean hasSeqColumn) {
-        List<String> jsonPaths = new ArrayList<>();
-        if (hasSeqColumn) {
-            jsonPaths.add("$." + SinkDdlBuilder.SEQUENCE_COLUMN);
-        }
+    /**
+     * jsonpaths 必须严格按目标表物理列顺序；UNIQUE 模型键列在前会重排字段映射，
+     * 若仍按映射顺序下发会造成 Stream Load 错列。
+     */
+    static List<String> dorisJsonPaths(SinkConfig config, List<String> physicalColumns) {
+        Set<String> mapped = new HashSet<>();
         for (SinkField field : config.getFieldMapping()) {
-            jsonPaths.add("$." + field.getTarget());
+            mapped.add(field.getTarget().toLowerCase(Locale.ROOT));
+        }
+        List<String> jsonPaths = new ArrayList<>();
+        for (String column : physicalColumns) {
+            if (SinkDdlBuilder.SEQUENCE_COLUMN.equalsIgnoreCase(column)
+                    || mapped.contains(column.toLowerCase(Locale.ROOT))) {
+                jsonPaths.add("$." + column);
+            }
         }
         return jsonPaths;
     }
 
+    /** JSON body 键与 jsonpaths 取同一物理列名，避免大小写差异导致取值为空。 */
+    static String[] jsonBodyKeys(SinkConfig config, List<String> physicalColumns) {
+        Map<String, String> byLower = new LinkedHashMap<>();
+        for (String column : physicalColumns) {
+            byLower.put(column.toLowerCase(Locale.ROOT), column);
+        }
+        String[] keys = new String[config.getFieldMapping().size()];
+        for (int i = 0; i < keys.length; i++) {
+            String target = config.getFieldMapping().get(i).getTarget();
+            String actual = byLower.get(target.toLowerCase(Locale.ROOT));
+            keys[i] = actual == null ? target : actual;
+        }
+        return keys;
+    }
+
     private byte[] buildJsonBody(SinkConfig config, List<Object[]> rows, int[] sourceIndexes,
-                                 boolean hasSeqColumn, long seqBase) {
+                                 String[] bodyKeys, boolean hasSeqColumn, long seqBase) {
         StringBuilder body = new StringBuilder();
         for (int r = 0; r < rows.size(); r++) {
             Map<String, Object> object = new LinkedHashMap<>();
             Object[] row = rows.get(r);
             for (int i = 0; i < config.getFieldMapping().size(); i++) {
-                SinkField field = config.getFieldMapping().get(i);
-                object.put(field.getTarget(), jsonValue(row[sourceIndexes[i]]));
+                object.put(bodyKeys[i], jsonValue(row[sourceIndexes[i]]));
             }
             if (hasSeqColumn) {
                 object.put(SinkDdlBuilder.SEQUENCE_COLUMN, seqBase + r + 1);
@@ -567,9 +595,10 @@ public class SinkWriteService {
 
     // --------------------------------------------------------------- Doris DDL
 
-    private void prepareDorisTarget(SinkConfig config, DorisClient.DorisEndpoint target,
-                                    SinkProgress progress) {
+    private List<ColumnInfo> prepareDorisTarget(SinkConfig config, DorisClient.DorisEndpoint target,
+                                                SinkProgress progress) {
         boolean exists = dorisClient.tableExistsStrict(target, config.getTableName());
+        boolean existed = exists;
         if (!exists) {
             if (!config.isAutoCreateTable()) {
                 throw tableMissing(config);
@@ -583,11 +612,44 @@ public class SinkWriteService {
                         "Sink 写入失败：目标表创建后仍不存在：" + config.getTableName());
             }
         }
-        validateStructure(config, dorisClient.listColumns(target, config.getTableName()), true);
+        List<ColumnInfo> actual = dorisClient.listColumns(target, config.getTableName());
+        validateStructure(config, actual, true);
+        // 仅对本次运行前已存在、且显式配置了模型的表校验实际模型/主键。
+        if (config.isTableModelExplicit() && existed) {
+            validateTableModel(config, target);
+        }
+        return actual;
     }
 
-    private boolean hasSequenceColumn(DorisClient.DorisEndpoint target, String table) {
-        for (ColumnInfo column : dorisClient.listColumns(target, table)) {
+    private void validateTableModel(SinkConfig config, DorisClient.DorisEndpoint target) {
+        DorisClient.TableMeta meta = dorisClient.describeTableModel(target, config.getTableName());
+        String expected = config.getTableModel();
+        String actualModel = meta.getModel();
+        if (actualModel == null || !expected.equalsIgnoreCase(actualModel)) {
+            throw SinkConfigParser.invalid(config.getNodeId(), "TABLE_MODEL_MISMATCH",
+                    "目标表建表模型为 " + (actualModel == null ? "未知" : actualModel)
+                            + "，与配置的 " + expected + " 不一致");
+        }
+        if (!config.isUniqueModel()) {
+            return;
+        }
+        Set<String> expectedKeys = new LinkedHashSet<>();
+        for (String key : config.getKeyColumns()) {
+            expectedKeys.add(key.toLowerCase(Locale.ROOT));
+        }
+        Set<String> actualKeys = new LinkedHashSet<>();
+        for (String key : meta.getKeyColumns()) {
+            actualKeys.add(key.toLowerCase(Locale.ROOT));
+        }
+        if (!expectedKeys.equals(actualKeys)) {
+            throw SinkConfigParser.invalid(config.getNodeId(), "KEY_COLUMNS_MISMATCH",
+                    "目标表主键与配置不一致：配置 " + config.getKeyColumns()
+                            + "，实际 " + meta.getKeyColumns());
+        }
+    }
+
+    private boolean hasSequenceColumn(List<ColumnInfo> columns) {
+        for (ColumnInfo column : columns) {
             if (SinkDdlBuilder.SEQUENCE_COLUMN.equalsIgnoreCase(column.getName())) {
                 return true;
             }
@@ -687,6 +749,9 @@ public class SinkWriteService {
         copy.setDataSourceId(config.getDataSourceId());
         copy.setTableName(config.getTableName());
         copy.setWriteMode(config.getWriteMode());
+        copy.setTableModel(config.getTableModel());
+        copy.setTableModelExplicit(config.isTableModelExplicit());
+        copy.setKeyColumns(config.getKeyColumns());
         copy.setBatchSize(config.getBatchSize());
         copy.setAutoCreateTable(config.isAutoCreateTable());
         copy.setWatermarkColumn(null);
@@ -812,6 +877,10 @@ public class SinkWriteService {
         result.getParams().put("targetType", config.getTargetType());
         result.getParams().put("targetTable", config.getTableName());
         result.getParams().put("writeMode", config.getWriteMode());
+        if (config.isDoris()) {
+            result.getParams().put("tableModel", config.getTableModel());
+            result.getParams().put("keyColumns", new ArrayList<>(config.getKeyColumns()));
+        }
         result.getParams().put("batchSize", config.getBatchSize());
         result.getParams().put("watermarkColumn", config.getWatermarkColumn());
         result.getParams().put("upstreamTable", upstreamTable);

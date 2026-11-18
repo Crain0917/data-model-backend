@@ -59,6 +59,8 @@ public class SinkConfigParser {
         }
         config.setWriteMode(writeMode);
 
+        parseTableModel(node, config);
+
         config.setBatchSize(parseBatchSize(node));
         config.setAutoCreateTable(node.boolValue("autoCreateTable", true));
 
@@ -161,7 +163,29 @@ public class SinkConfigParser {
             throw invalid(config.getNodeId(), "NO_OUTPUT_FIELDS", "上游节点没有可输出的字段");
         }
         config.setFieldMapping(resolved);
+        normalizeKeyColumns(config, resolved);
         return config;
+    }
+
+    /** 主键必须落在最终目标列上；大小写按目标列归一，顺序保持用户选择顺序。 */
+    private void normalizeKeyColumns(SinkConfig config, List<SinkField> resolved) {
+        if (!config.isUniqueModel()) {
+            return;
+        }
+        Map<String, String> targetNames = new LinkedHashMap<>();
+        for (SinkField field : resolved) {
+            targetNames.put(field.getTarget().toLowerCase(Locale.ROOT), field.getTarget());
+        }
+        List<String> keys = new ArrayList<>();
+        for (String key : config.getKeyColumns()) {
+            String actual = targetNames.get(key.toLowerCase(Locale.ROOT));
+            if (actual == null) {
+                throw invalid(config.getNodeId(), "KEY_COLUMN_UNKNOWN",
+                        "主键字段不在输出字段中：" + key);
+            }
+            keys.add(actual);
+        }
+        config.setKeyColumns(keys);
     }
 
     /** 运行时物理表校验：fieldMapping.source / watermarkColumn 必须真实存在。 */
@@ -203,6 +227,77 @@ public class SinkConfigParser {
                     target == null ? "" : target.trim(), type));
         }
         return fields;
+    }
+
+    /**
+     * Doris 建表模型与主键静态校验。tableModel 缺省按 DUPLICATE，
+     * 仅显式配置 Duplicate + 覆盖时拒绝，旧 DAG 不因此被阻断。
+     */
+    private void parseTableModel(DagNode node, SinkConfig config) {
+        if (!config.isDoris()) {
+            return;
+        }
+        JsonNode raw = node.config() == null ? null : node.config().get("tableModel");
+        boolean explicit = raw != null && !raw.isNull() && !raw.asText("").trim().isEmpty();
+        if (explicit) {
+            String model = upper(raw.asText());
+            if (!SinkConfig.UNIQUE.equals(model) && !SinkConfig.DUPLICATE.equals(model)) {
+                throw invalid(node.id(), "TABLE_MODEL_INVALID",
+                        "不支持的建表模型：" + raw.asText().trim());
+            }
+            config.setTableModel(model);
+            config.setTableModelExplicit(true);
+            if (SinkConfig.DUPLICATE.equals(model) && config.isOverwrite()) {
+                throw invalid(node.id(), "WRITE_MODE_UNSUPPORTED", "Duplicate Key 模型仅支持追加写入");
+            }
+        }
+        List<String> keys = parseKeyColumns(node);
+        if (!keys.isEmpty() && !config.isUniqueModel()) {
+            throw invalid(node.id(), "KEY_COLUMNS_UNSUPPORTED", "Duplicate Key 模型不支持设置主键");
+        }
+        if (config.isUniqueModel()) {
+            if (keys.isEmpty()) {
+                throw invalid(node.id(), "KEY_COLUMNS_REQUIRED", "Unique Key 模型请选择至少一个主键字段");
+            }
+            Set<String> seen = new LinkedHashSet<>();
+            for (String key : keys) {
+                String lower = key.toLowerCase(Locale.ROOT);
+                if (!seen.add(lower)) {
+                    throw invalid(node.id(), "KEY_COLUMN_DUPLICATE", "主键字段重复：" + key);
+                }
+                if (HIDDEN_COLUMNS.contains(lower)) {
+                    throw invalid(node.id(), "KEY_COLUMN_UNKNOWN", "主键字段不在输出字段中：" + key);
+                }
+            }
+        }
+        config.setKeyColumns(keys);
+    }
+
+    private List<String> parseKeyColumns(DagNode node) {
+        List<String> keys = new ArrayList<>();
+        JsonNode value = node.config() == null ? null : node.config().get("keyColumns");
+        if (value == null || value.isNull()) {
+            return keys;
+        }
+        if (value.isArray()) {
+            for (JsonNode item : value) {
+                String key = item == null || item.isNull() ? "" : item.asText("").trim();
+                if (!key.isEmpty()) {
+                    keys.add(key);
+                }
+            }
+            return keys;
+        }
+        String text = value.asText("").trim();
+        if (!text.isEmpty()) {
+            for (String part : text.split(",")) {
+                String key = part.trim();
+                if (!key.isEmpty()) {
+                    keys.add(key);
+                }
+            }
+        }
+        return keys;
     }
 
     private int parseBatchSize(DagNode node) {
