@@ -3,7 +3,9 @@ package com.datamodel.sql;
 import com.datamodel.common.BizException;
 import com.datamodel.common.ErrorCode;
 import com.datamodel.service.doris.DorisNameSanitizer;
+import com.datamodel.service.doris.SourceTableNameService;
 import com.fasterxml.jackson.databind.JsonNode;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -24,9 +26,17 @@ public class SqlBuilderFactory {
     private static final int MAX_DEPTH = 24;
 
     private final DorisNameSanitizer nameSanitizer;
+    private final SourceTableNameService sourceTableNameService;
 
     public SqlBuilderFactory(DorisNameSanitizer nameSanitizer) {
+        this(nameSanitizer, null);
+    }
+
+    @Autowired
+    public SqlBuilderFactory(DorisNameSanitizer nameSanitizer,
+                             SourceTableNameService sourceTableNameService) {
         this.nameSanitizer = nameSanitizer;
+        this.sourceTableNameService = sourceTableNameService;
     }
 
     public SqlBuildResult build(JsonNode dagJson, long flowId, String targetNodeId) {
@@ -74,7 +84,7 @@ public class SqlBuilderFactory {
 
     private SqlBuildResult buildSource(DagNode node, Dag dag, long flowId, Set<String> missing) {
         SqlBuildResult r = new SqlBuildResult();
-        String table = sourceTable(node);
+        String table = sourceTable(node, flowId);
         String sql = table == null
                 ? "-- 数据源副本表未配置：请选择数据源与表"
                 : "-- 数据源副本表 " + table;
@@ -505,11 +515,19 @@ public class SqlBuilderFactory {
             selects.add(Identifiers.ref(alias, column.getName(), q));
         }
         for (CalculatorRow row : rows) {
-            String a = calculatorOperand(alias, upCols, row.fieldA, q);
-            String b = calculatorOperand(alias, upCols, row.fieldB, q);
-            String c = calculatorOperand(alias, upCols, row.fieldC, q);
+            CalcSpec spec = CALC_SPECS.get(row.operation);
+            String a = calculatorFieldOperand(alias, upCols, row.fieldA, q);
+            String b = spec.arity >= 2
+                    ? calculatorArgumentOperand(alias, upCols, row.argBType, row.fieldB,
+                            row.literalB, q)
+                    : null;
+            String c = spec.arity >= 3
+                    ? calculatorArgumentOperand(alias, upCols, row.argCType, row.fieldC,
+                            row.literalC, q)
+                    : null;
             selects.add("CAST(" + calculatorExpression(row, a, b, c) + " AS "
-                    + calculatorType(node, row) + ") AS " + Identifiers.quote(row.output, q));
+                    + calculatorCastType(node, row, spec) + ") AS "
+                    + Identifiers.quote(row.output, q));
         }
 
         String sql = "SELECT\n  " + String.join(",\n  ", selects)
@@ -696,7 +714,8 @@ public class SqlBuilderFactory {
                 validateCalculations(node, rows, upCols);
                 List<OutputColumn> result = new ArrayList<>(upCols);
                 for (CalculatorRow row : rows) {
-                    result.add(new OutputColumn(row.output, calculatorType(node, row)));
+                    CalcSpec spec = CALC_SPECS.get(row.operation);
+                    result.add(new OutputColumn(row.output, calculatorType(node, row, spec)));
                 }
                 return result;
             }
@@ -992,11 +1011,112 @@ public class SqlBuilderFactory {
 
     // ------------------------------------------------------ calculator
 
-    private static final Set<String> CALC_OPERATIONS = new LinkedHashSet<>(java.util.Arrays.asList(
-            "ADD", "SUBTRACT", "MULTIPLY", "DIVIDE", "MOD", "ADD3", "MULTIPLY3"));
+    private enum CalcCategory {
+        NUMERIC, DATE_SHIFT, DATE_DIFF, DATE_EXTRACT, DATE_FORMAT, DATE_PARSE,
+        STRING, LENGTH, GENERIC
+    }
+
+    private static final String ARG_FIELD = "FIELD";
+    private static final String ARG_LITERAL = "LITERAL";
+
+    private static final class CalcSpec {
+        final CalcCategory category;
+        final int arity;
+        final boolean bOptional;
+        final String bDefaultMode;
+        final String cDefaultMode;
+        final boolean bLiteralOnly;
+
+        CalcSpec(CalcCategory category, int arity, boolean bOptional, String bDefaultMode,
+                 String cDefaultMode, boolean bLiteralOnly) {
+            this.category = category;
+            this.arity = arity;
+            this.bOptional = bOptional;
+            this.bDefaultMode = bDefaultMode;
+            this.cDefaultMode = cDefaultMode;
+            this.bLiteralOnly = bLiteralOnly;
+        }
+    }
+
+    /** 运算 → 类别/参数个数/常量规则。MAX 仅 64 个键，使用 LinkedHashMap 保持错误提示稳定。 */
+    private static final Map<String, CalcSpec> CALC_SPECS = new LinkedHashMap<>();
+
+    static {
+        numeric2("ADD");
+        numeric2("SUBTRACT");
+        numeric2("MULTIPLY");
+        numeric2("DIVIDE");
+        numeric2("MOD");
+        numeric3("ADD3", ARG_FIELD, ARG_FIELD);
+        numeric3("MULTIPLY3", ARG_FIELD, ARG_FIELD);
+        numeric3("AVG3", ARG_FIELD, ARG_FIELD);
+        numeric2("MIN");
+        numeric2("MAX");
+        addSpec("ROUND", CalcCategory.NUMERIC, 2, true, ARG_FIELD, ARG_FIELD, false);
+        addSpec("STDROUND", CalcCategory.NUMERIC, 2, true, ARG_FIELD, ARG_FIELD, false);
+        addSpec("CEIL", CalcCategory.NUMERIC, 1, false, ARG_FIELD, ARG_FIELD, false);
+        addSpec("FLOOR", CalcCategory.NUMERIC, 1, false, ARG_FIELD, ARG_FIELD, false);
+        addSpec("NVL", CalcCategory.GENERIC, 2, false, ARG_FIELD, ARG_FIELD, false);
+
+        for (String unit : new String[]{"DAYS", "MONTHS", "HOURS", "MINUTES", "SECONDS"}) {
+            addSpec("DATE_ADD_" + unit, CalcCategory.DATE_SHIFT, 2, false,
+                    ARG_LITERAL, ARG_LITERAL, false);
+            addSpec("DATE_SUB_" + unit, CalcCategory.DATE_SHIFT, 2, false,
+                    ARG_LITERAL, ARG_LITERAL, false);
+        }
+        addSpec("DATE_DIFF_DAYS", CalcCategory.DATE_DIFF, 2, false,
+                ARG_FIELD, ARG_FIELD, false);
+        addSpec("DATE_DIFF_HOURS", CalcCategory.DATE_DIFF, 2, false,
+                ARG_FIELD, ARG_FIELD, false);
+        addSpec("DATE_DIFF_MINUTES", CalcCategory.DATE_DIFF, 2, false,
+                ARG_FIELD, ARG_FIELD, false);
+        addSpec("DATE_DIFF_SECONDS", CalcCategory.DATE_DIFF, 2, false,
+                ARG_FIELD, ARG_FIELD, false);
+
+        for (String op : new String[]{"YEAR_OF_DATE", "MONTH_OF_DATE", "DAY_OF_MONTH",
+                "DAY_OF_WEEK", "DAY_OF_YEAR", "WEEK_OF_YEAR", "QUARTER_OF_DATE",
+                "HOUR_OF_DAY", "MINUTE_OF_HOUR", "SECOND_OF_MINUTE"}) {
+            addSpec(op, CalcCategory.DATE_EXTRACT, 1, false, ARG_FIELD, ARG_FIELD, false);
+        }
+
+        addSpec("DATE_FORMAT", CalcCategory.DATE_FORMAT, 2, false,
+                ARG_LITERAL, ARG_LITERAL, true);
+        addSpec("DATE_PARSE", CalcCategory.DATE_PARSE, 2, false,
+                ARG_LITERAL, ARG_LITERAL, true);
+
+        for (String op : new String[]{"UPPER", "LOWER", "INITCAP", "TRIM", "LTRIM", "RTRIM"}) {
+            addSpec(op, CalcCategory.STRING, 1, false, ARG_FIELD, ARG_FIELD, false);
+        }
+        addSpec("LENGTH", CalcCategory.LENGTH, 1, false, ARG_FIELD, ARG_FIELD, false);
+        addSpec("SUBSTRING", CalcCategory.STRING, 3, false,
+                ARG_LITERAL, ARG_LITERAL, false);
+        addSpec("LEFT", CalcCategory.STRING, 2, false, ARG_FIELD, ARG_FIELD, false);
+        addSpec("RIGHT", CalcCategory.STRING, 2, false, ARG_FIELD, ARG_FIELD, false);
+        addSpec("REPLACE", CalcCategory.STRING, 3, false,
+                ARG_LITERAL, ARG_LITERAL, false);
+        addSpec("CONCAT2", CalcCategory.STRING, 2, false, ARG_FIELD, ARG_FIELD, false);
+        addSpec("CONCAT3", CalcCategory.STRING, 3, false, ARG_FIELD, ARG_FIELD, false);
+        addSpec("LPAD", CalcCategory.STRING, 3, false,
+                ARG_LITERAL, ARG_LITERAL, false);
+        addSpec("RPAD", CalcCategory.STRING, 3, false,
+                ARG_LITERAL, ARG_LITERAL, false);
+    }
+
+    private static void numeric2(String op) {
+        addSpec(op, CalcCategory.NUMERIC, 2, false, ARG_FIELD, ARG_FIELD, false);
+    }
+
+    private static void numeric3(String op, String bMode, String cMode) {
+        addSpec(op, CalcCategory.NUMERIC, 3, false, bMode, cMode, false);
+    }
+
+    private static void addSpec(String op, CalcCategory category, int arity, boolean bOptional,
+                                String bMode, String cMode, boolean bLiteralOnly) {
+        CALC_SPECS.put(op, new CalcSpec(category, arity, bOptional, bMode, cMode, bLiteralOnly));
+    }
 
     private static final Set<String> CALC_TYPES = new LinkedHashSet<>(java.util.Arrays.asList(
-            "DOUBLE", "DECIMAL", "BIGINT", "INT"));
+            "DOUBLE", "DECIMAL", "BIGINT", "INT", "DATE", "DATETIME", "STRING"));
 
     private static final class CalculatorRow {
         final String output;
@@ -1004,24 +1124,29 @@ public class SqlBuilderFactory {
         final String fieldA;
         final String fieldB;
         final String fieldC;
+        final String argBType;
+        final String argCType;
+        final String literalB;
+        final String literalC;
         final String returnType;
         final Integer length;
         final Integer precision;
 
         CalculatorRow(String output, String operation, String fieldA, String fieldB, String fieldC,
+                      String argBType, String argCType, String literalB, String literalC,
                       String returnType, Integer length, Integer precision) {
             this.output = output;
             this.operation = operation;
             this.fieldA = fieldA;
             this.fieldB = fieldB;
             this.fieldC = fieldC;
+            this.argBType = argBType;
+            this.argCType = argCType;
+            this.literalB = literalB;
+            this.literalC = literalC;
             this.returnType = returnType;
             this.length = length;
             this.precision = precision;
-        }
-
-        boolean ternary() {
-            return "ADD3".equals(operation) || "MULTIPLY3".equals(operation);
         }
     }
 
@@ -1032,18 +1157,40 @@ public class SqlBuilderFactory {
             return rows;
         }
         for (JsonNode c : calculations) {
+            String operation = c.path("operation").asText("").trim().toUpperCase(Locale.ROOT);
+            CalcSpec spec = CALC_SPECS.get(operation);
+            String bDefault = spec == null ? ARG_FIELD : spec.bDefaultMode;
+            String cDefault = spec == null ? ARG_FIELD : spec.cDefaultMode;
             String returnType = c.path("returnType").asText("").trim().toUpperCase(Locale.ROOT);
             rows.add(new CalculatorRow(
                     c.path("output").asText("").trim(),
-                    c.path("operation").asText("").trim().toUpperCase(Locale.ROOT),
+                    operation,
                     c.path("fieldA").asText("").trim(),
                     c.path("fieldB").asText("").trim(),
                     c.path("fieldC").asText("").trim(),
-                    returnType.isEmpty() ? "DOUBLE" : returnType,
+                    argumentMode(c.path("argBType").asText(""), bDefault),
+                    argumentMode(c.path("argCType").asText(""), cDefault),
+                    textOrNull(c.get("literalB")),
+                    textOrNull(c.get("literalC")),
+                    returnType,
                     intOrNull(c.get("length")),
                     intOrNull(c.get("precision"))));
         }
         return rows;
+    }
+
+    private static String argumentMode(String raw, String fallback) {
+        if (raw == null || raw.trim().isEmpty()) {
+            return fallback;
+        }
+        return raw.trim().toUpperCase(Locale.ROOT);
+    }
+
+    private static String textOrNull(JsonNode value) {
+        if (value == null || value.isNull()) {
+            return null;
+        }
+        return value.asText();
     }
 
     private static void validateCalculations(DagNode node, List<CalculatorRow> rows,
@@ -1053,18 +1200,23 @@ public class SqlBuilderFactory {
             outputs.add(column.getName().toLowerCase(Locale.ROOT));
         }
         for (CalculatorRow row : rows) {
-            if (!CALC_OPERATIONS.contains(row.operation)) {
+            CalcSpec spec = CALC_SPECS.get(row.operation);
+            if (spec == null) {
                 throw nodeError(node, "CALC_OPERATION_INVALID",
                         row.operation.isEmpty()
                                 ? "Calculator 运算不能为空"
                                 : "Calculator 不支持的运算：" + row.operation);
             }
             requireCalculatorField(node, row, "A", row.fieldA, upCols);
-            requireCalculatorField(node, row, "B", row.fieldB, upCols);
-            if (row.ternary()) {
-                requireCalculatorField(node, row, "C", row.fieldC, upCols);
+            if (spec.arity >= 2) {
+                validateCalculatorArgument(node, row, "B", row.argBType, row.fieldB,
+                        row.literalB, spec.bLiteralOnly, spec.bOptional, upCols);
             }
-            calculatorType(node, row);
+            if (spec.arity >= 3) {
+                validateCalculatorArgument(node, row, "C", row.argCType, row.fieldC,
+                        row.literalC, false, false, upCols);
+            }
+            calculatorType(node, row, spec);
             String out;
             try {
                 out = Identifiers.requireField(row.output);
@@ -1081,6 +1233,45 @@ public class SqlBuilderFactory {
         }
     }
 
+    private static void validateCalculatorArgument(DagNode node, CalculatorRow row, String label,
+                                                   String mode, String field, String literal,
+                                                   boolean literalOnly, boolean optional,
+                                                   List<OutputColumn> upCols) {
+        boolean absent = field.isEmpty() && literal == null;
+        if (optional && absent) {
+            return;
+        }
+        if (!ARG_FIELD.equals(mode) && !ARG_LITERAL.equals(mode)) {
+            throw calcArgumentError(node, row,
+                    "Calculator 运算 " + row.operation + " 参数 " + label + " 的取值方式不支持：" + mode);
+        }
+        if (ARG_LITERAL.equals(mode)) {
+            if (literal == null) {
+                throw calcArgumentError(node, row,
+                        "Calculator 运算 " + row.operation + " 参数 " + label + " 的常量不能为空");
+            }
+            if (literalOnly && literal.trim().isEmpty()) {
+                throw calcArgumentError(node, row,
+                        "Calculator 运算 " + row.operation + " 参数 " + label + " 需要非空的格式掩码");
+            }
+            return;
+        }
+        if (literalOnly) {
+            throw calcArgumentError(node, row,
+                    "Calculator 运算 " + row.operation + " 参数 " + label + " 仅支持常量模式");
+        }
+        requireCalculatorField(node, row, label, field, upCols);
+    }
+
+    private static BizException calcArgumentError(DagNode node, CalculatorRow row, String message) {
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("nodeId", node.id());
+        data.put("reason", "CALC_ARGUMENT_INVALID");
+        data.put("operation", row.operation);
+        data.put("output", row.output);
+        return new BizException(ErrorCode.DAG_INVALID, message, data);
+    }
+
     private static void requireCalculatorField(DagNode node, CalculatorRow row, String label,
                                                String field, List<OutputColumn> upCols) {
         if (field.isEmpty()) {
@@ -1093,12 +1284,62 @@ public class SqlBuilderFactory {
         }
     }
 
-    private static String calculatorType(DagNode node, CalculatorRow row) {
-        if (!CALC_TYPES.contains(row.returnType)) {
-            throw nodeError(node, "CALC_OUTPUT_INVALID",
-                    "Calculator 不支持的目标类型：" + row.returnType);
+    private static Set<String> calculatorAllowedTypes(CalcCategory category) {
+        switch (category) {
+            case NUMERIC:
+                return new LinkedHashSet<>(java.util.Arrays.asList(
+                        "DOUBLE", "DECIMAL", "BIGINT", "INT"));
+            case DATE_SHIFT:
+                return new LinkedHashSet<>(java.util.Arrays.asList("DATE", "DATETIME"));
+            case DATE_DIFF:
+                return new LinkedHashSet<>(java.util.Arrays.asList("BIGINT", "INT"));
+            case DATE_EXTRACT:
+                return new LinkedHashSet<>(java.util.Arrays.asList("INT", "BIGINT"));
+            case DATE_FORMAT:
+            case STRING:
+                return new LinkedHashSet<>(java.util.Collections.singletonList("STRING"));
+            case DATE_PARSE:
+                return new LinkedHashSet<>(java.util.Arrays.asList("DATETIME", "DATE"));
+            case LENGTH:
+                return new LinkedHashSet<>(java.util.Arrays.asList("INT", "BIGINT"));
+            case GENERIC:
+            default:
+                return new LinkedHashSet<>(java.util.Arrays.asList(
+                        "DOUBLE", "DECIMAL", "BIGINT", "INT", "STRING", "DATE", "DATETIME"));
         }
-        if ("DECIMAL".equals(row.returnType)) {
+    }
+
+    private static String calculatorDefaultType(CalcCategory category) {
+        switch (category) {
+            case DATE_SHIFT:
+                return "DATETIME";
+            case DATE_DIFF:
+                return "BIGINT";
+            case DATE_EXTRACT:
+                return "INT";
+            case DATE_FORMAT:
+            case STRING:
+                return "STRING";
+            case DATE_PARSE:
+                return "DATETIME";
+            case LENGTH:
+                return "BIGINT";
+            case NUMERIC:
+            case GENERIC:
+            default:
+                return "DOUBLE";
+        }
+    }
+
+    private static String calculatorType(DagNode node, CalculatorRow row, CalcSpec spec) {
+        String effective = row.returnType.isEmpty()
+                ? calculatorDefaultType(spec.category) : row.returnType;
+        if (!CALC_TYPES.contains(effective)
+                || !calculatorAllowedTypes(spec.category).contains(effective)) {
+            throw nodeError(node, "CALC_OUTPUT_INVALID",
+                    "Calculator 运算 " + row.operation + " 不支持的目标类型：" + effective);
+        }
+        if ("DECIMAL".equals(effective)) {
             int p = row.length == null || row.length <= 0 ? 18 : row.length;
             int s = row.precision == null || row.precision < 0 ? 2 : row.precision;
             if (p < 1 || p > 38 || s < 0 || s > p) {
@@ -1107,16 +1348,51 @@ public class SqlBuilderFactory {
             }
             return "DECIMAL(" + p + "," + s + ")";
         }
-        return row.returnType;
+        if ("STRING".equals(effective)) {
+            int len = row.length == null || row.length <= 0 ? 255 : row.length;
+            return "VARCHAR(" + len + ")";
+        }
+        return effective;
     }
 
-    private static String calculatorOperand(String alias, List<OutputColumn> cols, String field,
-                                            Identifiers.QuoteStyle q) {
+    private static String calculatorCastType(DagNode node, CalculatorRow row, CalcSpec spec) {
+        String type = calculatorType(node, row, spec);
+        return type.startsWith("VARCHAR") ? "STRING" : type;
+    }
+
+    private static String calculatorFieldOperand(String alias, List<OutputColumn> cols, String field,
+                                                 Identifiers.QuoteStyle q) {
         if (field.isEmpty()) {
             return null;
         }
         OutputColumn column = findColumn(cols, field);
         return column == null ? null : Identifiers.ref(alias, column.getName(), q);
+    }
+
+    private static String calculatorArgumentOperand(String alias, List<OutputColumn> cols,
+                                                    String mode, String field, String literal,
+                                                    Identifiers.QuoteStyle q) {
+        if (ARG_LITERAL.equals(mode)) {
+            return literal == null ? null : stringLiteral(literal);
+        }
+        if (field.isEmpty()) {
+            return null;
+        }
+        OutputColumn column = findColumn(cols, field);
+        return column == null ? null : Identifiers.ref(alias, column.getName(), q);
+    }
+
+    /** 银行家舍入：恰好 .5 时取最近的偶数，其余按常规舍入；b 为空按 0 位小数。 */
+    private static String bankersRound(String a, String b) {
+        String decimals = b == null ? "0" : b;
+        String scaled = "(" + a + " * POW(10, " + decimals + "))";
+        String floor = "FLOOR(" + scaled + ")";
+        String fraction = "(" + scaled + " - " + floor + ")";
+        return "(" + floor
+                + " + CASE WHEN " + fraction + " > 0.5 THEN 1"
+                + " WHEN " + fraction + " < 0.5 THEN 0"
+                + " WHEN MOD(" + floor + ", 2) = 0 THEN 0 ELSE 1 END)"
+                + " / POW(10, " + decimals + ")";
     }
 
     private static String calculatorExpression(CalculatorRow row, String a, String b, String c) {
@@ -1135,6 +1411,105 @@ public class SqlBuilderFactory {
                 return a + " + " + b + " + " + c;
             case "MULTIPLY3":
                 return a + " * " + b + " * " + c;
+            case "AVG3":
+                return "(" + a + " + " + b + " + " + c + ") / 3";
+            case "MIN":
+                return "LEAST(" + a + ", " + b + ")";
+            case "MAX":
+                return "GREATEST(" + a + ", " + b + ")";
+            // 当前 Doris 的 DROUND 与 ROUND 均为四舍五入，这里显式实现银行家舍入（半偶）。
+            case "ROUND":
+                return bankersRound(a, b);
+            case "STDROUND":
+                return b == null ? "ROUND(" + a + ")" : "ROUND(" + a + ", " + b + ")";
+            case "CEIL":
+                return "CEIL(" + a + ")";
+            case "FLOOR":
+                return "FLOOR(" + a + ")";
+            case "NVL":
+                return "IFNULL(" + a + ", " + b + ")";
+            case "DATE_ADD_DAYS":
+                return "DATE_ADD(" + a + ", INTERVAL " + b + " DAY)";
+            case "DATE_ADD_MONTHS":
+                return "DATE_ADD(" + a + ", INTERVAL " + b + " MONTH)";
+            case "DATE_ADD_HOURS":
+                return "DATE_ADD(" + a + ", INTERVAL " + b + " HOUR)";
+            case "DATE_ADD_MINUTES":
+                return "DATE_ADD(" + a + ", INTERVAL " + b + " MINUTE)";
+            case "DATE_ADD_SECONDS":
+                return "DATE_ADD(" + a + ", INTERVAL " + b + " SECOND)";
+            case "DATE_SUB_DAYS":
+                return "DATE_SUB(" + a + ", INTERVAL " + b + " DAY)";
+            case "DATE_SUB_MONTHS":
+                return "DATE_SUB(" + a + ", INTERVAL " + b + " MONTH)";
+            case "DATE_SUB_HOURS":
+                return "DATE_SUB(" + a + ", INTERVAL " + b + " HOUR)";
+            case "DATE_SUB_MINUTES":
+                return "DATE_SUB(" + a + ", INTERVAL " + b + " MINUTE)";
+            case "DATE_SUB_SECONDS":
+                return "DATE_SUB(" + a + ", INTERVAL " + b + " SECOND)";
+            case "DATE_DIFF_DAYS":
+                return "DATEDIFF(" + a + ", " + b + ")";
+            case "DATE_DIFF_HOURS":
+                return "TIMESTAMPDIFF(HOUR, " + b + ", " + a + ")";
+            case "DATE_DIFF_MINUTES":
+                return "TIMESTAMPDIFF(MINUTE, " + b + ", " + a + ")";
+            case "DATE_DIFF_SECONDS":
+                return "TIMESTAMPDIFF(SECOND, " + b + ", " + a + ")";
+            case "YEAR_OF_DATE":
+                return "YEAR(" + a + ")";
+            case "MONTH_OF_DATE":
+                return "MONTH(" + a + ")";
+            case "DAY_OF_MONTH":
+                return "DAY(" + a + ")";
+            case "DAY_OF_WEEK":
+                return "DAYOFWEEK(" + a + ")";
+            case "DAY_OF_YEAR":
+                return "DAYOFYEAR(" + a + ")";
+            case "WEEK_OF_YEAR":
+                return "WEEK(" + a + ")";
+            case "QUARTER_OF_DATE":
+                return "QUARTER(" + a + ")";
+            case "HOUR_OF_DAY":
+                return "HOUR(" + a + ")";
+            case "MINUTE_OF_HOUR":
+                return "MINUTE(" + a + ")";
+            case "SECOND_OF_MINUTE":
+                return "SECOND(" + a + ")";
+            case "DATE_FORMAT":
+                return "DATE_FORMAT(" + a + ", " + b + ")";
+            case "DATE_PARSE":
+                return "STR_TO_DATE(" + a + ", " + b + ")";
+            case "UPPER":
+                return "UPPER(" + a + ")";
+            case "LOWER":
+                return "LOWER(" + a + ")";
+            case "INITCAP":
+                return "INITCAP(" + a + ")";
+            case "TRIM":
+                return "TRIM(" + a + ")";
+            case "LTRIM":
+                return "LTRIM(" + a + ")";
+            case "RTRIM":
+                return "RTRIM(" + a + ")";
+            case "LENGTH":
+                return "LENGTH(" + a + ")";
+            case "SUBSTRING":
+                return "SUBSTRING(" + a + ", " + b + ", " + c + ")";
+            case "LEFT":
+                return "LEFT(" + a + ", " + b + ")";
+            case "RIGHT":
+                return "RIGHT(" + a + ", " + b + ")";
+            case "REPLACE":
+                return "REPLACE(" + a + ", " + b + ", " + c + ")";
+            case "CONCAT2":
+                return "CONCAT(" + a + ", " + b + ")";
+            case "CONCAT3":
+                return "CONCAT(" + a + ", " + b + ", " + c + ")";
+            case "LPAD":
+                return "LPAD(" + a + ", " + b + ", " + c + ")";
+            case "RPAD":
+                return "RPAD(" + a + ", " + b + ", " + c + ")";
             default:
                 return a;
         }
@@ -1297,7 +1672,11 @@ public class SqlBuilderFactory {
         private static final Set<String> FUNCTIONS = new LinkedHashSet<>(java.util.Arrays.asList(
                 "SUM", "ABS", "ROUND", "CEIL", "CEILING", "FLOOR", "COALESCE", "IFNULL", "NULLIF",
                 "CONCAT", "TRIM", "LTRIM", "RTRIM", "LOWER", "UPPER", "LENGTH", "SUBSTR",
-                "SUBSTRING", "GREATEST", "LEAST"));
+                "SUBSTRING", "GREATEST", "LEAST",
+                "NVL", "DATE_FORMAT", "STR_TO_DATE", "DATEDIFF",
+                "YEAR", "MONTH", "DAY", "DAYOFWEEK", "DAYOFYEAR", "WEEK", "QUARTER",
+                "HOUR", "MINUTE", "SECOND",
+                "LEFT", "RIGHT", "REPLACE", "LPAD", "RPAD", "INITCAP"));
 
         private final DagNode node;
         private final List<OutputColumn> upCols;
@@ -1531,7 +1910,8 @@ public class SqlBuilderFactory {
             for (FormulaExpr arg : args) {
                 parts.add(arg.sql);
             }
-            return new FormulaExpr(4, name + "(" + String.join(", ", parts) + ")");
+            String sqlName = "NVL".equals(name) ? "IFNULL" : name;
+            return new FormulaExpr(4, sqlName + "(" + String.join(", ", parts) + ")");
         }
 
         private static boolean isAggregateFunction(String name) {
@@ -1580,6 +1960,32 @@ public class SqlBuilderFactory {
                 case "SUBSTR":
                 case "SUBSTRING":
                     ok = count == 2 || count == 3;
+                    break;
+                case "NVL":
+                case "DATE_FORMAT":
+                case "STR_TO_DATE":
+                case "DATEDIFF":
+                case "LEFT":
+                case "RIGHT":
+                    ok = count == 2;
+                    break;
+                case "YEAR":
+                case "MONTH":
+                case "DAY":
+                case "DAYOFWEEK":
+                case "DAYOFYEAR":
+                case "WEEK":
+                case "QUARTER":
+                case "HOUR":
+                case "MINUTE":
+                case "SECOND":
+                case "INITCAP":
+                    ok = count == 1;
+                    break;
+                case "REPLACE":
+                case "LPAD":
+                case "RPAD":
+                    ok = count == 3;
                     break;
                 default:
                     ok = true;
@@ -1677,7 +2083,7 @@ public class SqlBuilderFactory {
 
     private String tableOf(DagNode node, Dag dag, long flowId, Set<String> missing) {
         if ("source".equals(node.type())) {
-            String table = sourceTable(node);
+            String table = sourceTable(node, flowId);
             if (table == null) {
                 missing.add(node.id());
                 return "<missing_upstream>";
@@ -1691,12 +2097,17 @@ public class SqlBuilderFactory {
         return nameSanitizer.middleTable(flowId, node.id());
     }
 
-    private String sourceTable(DagNode node) {
+    private String sourceTable(DagNode node, long flowId) {
         Long dsId = node.longValue("dataSourceId");
         String table = node.text("tableName", null);
         if (dsId == null || table == null || table.trim().isEmpty()) {
             return null;
         }
-        return nameSanitizer.sourceTable(dsId, table.trim());
+        if (sourceTableNameService != null) {
+            return sourceTableNameService.resolve(flowId, dsId, table.trim());
+        }
+        String stable = nameSanitizer.stableSuffix(
+                flowId + "|" + dsId + "|" + table.trim().toLowerCase(Locale.ROOT));
+        return nameSanitizer.flowSourceTable(flowId, table.trim(), stable);
     }
 }

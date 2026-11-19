@@ -132,22 +132,26 @@ public class DorisClient {
                 props.getHttpPort(), props.getUser(), props.getPassword(), props.getSchema());
     }
 
+    public static final String STREAM_LOAD_PORT_MISSING_MESSAGE =
+            "该 Doris 数据源未配置 Stream Load HTTP 端口，请在数据源配置中填写 httpPort（通常为 8040）后重试";
+
+    /** 用户 Doris 数据源显式配置的 Stream Load HTTP 端口（extraParams.httpPort）；未配置返回 null。 */
+    public Integer configuredHttpPort(DataSourceEntity ds) {
+        return ds == null ? null : extraHttpPort(ds.getExtraParams());
+    }
+
     /**
-     * 由用户配置的 Doris 数据源构造端点。HTTP 端口解析顺序：
-     * extraParams.httpPort → 与平台地址完全一致时用平台 httpPort → queryPort-1000。
+     * 由用户配置的 Doris 数据源构造端点。HTTP 端口只取 extraParams.httpPort，
+     * 不再按 queryPort-1000 推导，避免写错端口后静默失败。
      */
     public DorisEndpoint endpointFor(DataSourceEntity ds, String plainPassword) {
         String host = ds.getHost();
         int queryPort = ds.getPort() == null ? props.getQueryPort() : ds.getPort();
         String database = ds.getDefaultDb() == null || ds.getDefaultDb().trim().isEmpty()
                 ? props.getSchema() : ds.getDefaultDb().trim();
-        Integer httpPort = extraHttpPort(ds.getExtraParams());
+        Integer httpPort = configuredHttpPort(ds);
         if (httpPort == null) {
-            if (host != null && host.equals(props.getHost()) && queryPort == props.getQueryPort()) {
-                httpPort = props.getHttpPort();
-            } else {
-                httpPort = queryPort > 1000 ? queryPort - 1000 : 8040;
-            }
+            throw new BizException(ErrorCode.SINK_CONFIG_INVALID, STREAM_LOAD_PORT_MISSING_MESSAGE);
         }
         return new DorisEndpoint(ds.getName(), host, queryPort, httpPort,
                 ds.getUsername() == null ? "" : ds.getUsername(),

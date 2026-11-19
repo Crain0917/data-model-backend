@@ -70,7 +70,7 @@ data-model-backend/
 | `DS_CONNECT_TIMEOUT_MS` | 否 | `5000` | 被测数据源连接超时（毫秒） |
 | `DS_QUERY_TIMEOUT_SECONDS` | 否 | `10` | 被测数据源查询超时（秒） |
 | `CORS_ALLOWED_ORIGINS` | 否 | `http://localhost:5173,http://127.0.0.1:5173` | 前端来源白名单，逗号分隔 |
-| `DORIS_HOST` | 否 | `192.168.10.11` | Doris FE 主机 |
+| `DORIS_HOST` | 否 | `192.168.10.13` | Doris FE 主机 |
 | `DORIS_HTTP_PORT` | 否 | `8040` | Stream Load HTTP 端口 |
 | `DORIS_QUERY_PORT` | 否 | `9030` | Doris MySQL 协议端口 |
 | `DORIS_USER` | 是（物化时） | 无 | Doris 账号；未设置时预览仍可用，执行报 `5002` |
@@ -108,7 +108,7 @@ mvn clean package
 启动（示例，密码由 shell 环境提供，不写进命令历史或文档）：
 
 ```bash
-export DB_HOST=192.168.10.11
+export DB_HOST=192.168.10.13
 export DB_PORT=3306
 export DB_NAME=data_model
 export DB_USER=data_model
@@ -120,7 +120,7 @@ java -jar target/data-model-backend.jar
 Windows CMD：
 
 ```bat
-set DB_HOST=192.168.10.11
+set DB_HOST=192.168.10.13
 set DB_PORT=3306
 set DB_NAME=data_model
 set DB_USER=data_model
@@ -238,7 +238,7 @@ curl -s -X POST "$BASE/api/data-source" \
   -d '{
     "name":"ods_mysql",
     "type":"MYSQL",
-    "host":"192.168.10.11",
+    "host":"192.168.10.13",
     "port":3306,
     "dbName":"data_model",
     "username":"data_model",
@@ -284,7 +284,7 @@ curl -s -X PUT "$BASE/api/data-source/1" \
   -d '{
     "name":"ods_mysql",
     "type":"MYSQL",
-    "host":"192.168.10.11",
+    "host":"192.168.10.13",
     "port":3306,
     "dbName":"data_model",
     "username":"data_model",
@@ -309,7 +309,7 @@ curl -s -X POST "$BASE/api/data-source" \
   -d '{
     "name":"ods_doris",
     "type":"DORIS",
-    "host":"192.168.10.11",
+    "host":"192.168.10.13",
     "port":9030,
     "dbName":"data_model",
     "username":"data_model",

@@ -20,6 +20,35 @@ public class DorisNameSanitizer {
         return fit("dm_src_" + dataSourceId + "_" + sanitizePart(sourceTable));
     }
 
+    /**
+     * 任务源表名：dm_src_{flowId}_{源表名}_{6位随机后缀}。
+     * 超长时截断源表名片段并插入源表名 MD5 前 6 位，随机后缀始终保留，总长不超过 64。
+     */
+    public String flowSourceTable(long flowId, String sourceTable, String suffix) {
+        String random = sanitizePart(suffix);
+        if (random.length() > HASH_LEN) {
+            random = random.substring(0, HASH_LEN);
+        }
+        String prefix = "dm_src_" + flowId + "_";
+        String tail = "_" + random;
+        String part = sanitizePart(sourceTable);
+        if (prefix.length() + part.length() + tail.length() <= MAX_LEN) {
+            return prefix + part + tail;
+        }
+        int room = MAX_LEN - prefix.length() - HASH_LEN - 2 - random.length();
+        if (room < 1) {
+            return fit(prefix + random);
+        }
+        String shortened = part.substring(0, room);
+        while (shortened.endsWith("_")) {
+            shortened = shortened.substring(0, shortened.length() - 1);
+        }
+        if (shortened.isEmpty()) {
+            shortened = "t";
+        }
+        return prefix + shortened + "_" + md5(part).substring(0, HASH_LEN) + tail;
+    }
+
     public String middleTable(long flowId, String nodeId) {
         return fit("dm_mid_" + flowId + "_" + sanitizePart(nodeId));
     }
@@ -27,6 +56,11 @@ public class DorisNameSanitizer {
     /** 某任务全部中间表的公共前缀（用于保存画布时对账清理）。 */
     public String middleTablePrefix(long flowId) {
         return "dm_mid_" + flowId + "_";
+    }
+
+    /** 某任务全部源表副本的公共前缀（用于保存画布/删除任务时对账清理）。 */
+    public String sourceTablePrefix(long flowId) {
+        return "dm_src_" + flowId + "_";
     }
 
     /** 清洗任意片段：小写、非 [a-z0-9_] 变 _、折叠下划线、去首尾下划线。 */
@@ -80,6 +114,11 @@ public class DorisNameSanitizer {
             truncated = truncated.substring(0, truncated.length() - 1);
         }
         return truncated + "_" + hash;
+    }
+
+    /** 确定性 6 位后缀（元数据不可用时的稳定兜底）。 */
+    public String stableSuffix(String value) {
+        return md5(value == null ? "" : value).substring(0, HASH_LEN);
     }
 
     static String md5(String value) {

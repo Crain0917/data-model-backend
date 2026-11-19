@@ -8,6 +8,7 @@ import com.datamodel.dto.SqlPreviewRequest;
 import com.datamodel.dto.SqlPreviewResponse;
 import com.datamodel.service.doris.DorisClient;
 import com.datamodel.service.doris.DorisNameSanitizer;
+import com.datamodel.service.doris.SourceTableNameService;
 import com.datamodel.sql.Dag;
 import com.datamodel.sql.DagNode;
 import com.datamodel.sql.SqlBuildResult;
@@ -29,17 +30,20 @@ public class NodeSqlService {
     private final SqlBuilderFactory sqlBuilderFactory;
     private final DorisClient dorisClient;
     private final DorisNameSanitizer nameSanitizer;
+    private final SourceTableNameService sourceTableNameService;
     private final DorisProperties dorisProperties;
 
     public NodeSqlService(FlowService flowService,
                           SqlBuilderFactory sqlBuilderFactory,
                           DorisClient dorisClient,
                           DorisNameSanitizer nameSanitizer,
+                          SourceTableNameService sourceTableNameService,
                           DorisProperties dorisProperties) {
         this.flowService = flowService;
         this.sqlBuilderFactory = sqlBuilderFactory;
         this.dorisClient = dorisClient;
         this.nameSanitizer = nameSanitizer;
+        this.sourceTableNameService = sourceTableNameService;
         this.dorisProperties = dorisProperties;
     }
 
@@ -125,7 +129,8 @@ public class NodeSqlService {
                     Long dsId = node.longValue("dataSourceId");
                     String table = node.text("tableName", null);
                     if (dsId != null && table != null && !table.trim().isEmpty()
-                            && !dorisClient.tableExists(nameSanitizer.sourceTable(dsId, table))) {
+                            && !dorisClient.tableExists(
+                            sourceTableNameService.resolve(flowId, dsId, table.trim()))) {
                         missing.add(node.id());
                     }
                 } else if (!"sink".equals(node.type())

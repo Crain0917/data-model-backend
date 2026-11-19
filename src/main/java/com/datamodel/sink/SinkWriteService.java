@@ -58,6 +58,7 @@ public class SinkWriteService {
 
     private final DorisClient dorisClient;
     private final DorisNameSanitizer nameSanitizer;
+    private final com.datamodel.service.doris.SourceTableNameService sourceTableNameService;
     private final SinkConfigParser configParser;
     private final SinkWatermarkRepository watermarkRepository;
     private final JdbcConnector jdbcConnector;
@@ -67,6 +68,7 @@ public class SinkWriteService {
 
     public SinkWriteService(DorisClient dorisClient,
                             DorisNameSanitizer nameSanitizer,
+                            com.datamodel.service.doris.SourceTableNameService sourceTableNameService,
                             SinkConfigParser configParser,
                             SinkWatermarkRepository watermarkRepository,
                             JdbcConnector jdbcConnector,
@@ -75,6 +77,7 @@ public class SinkWriteService {
                             ObjectMapper objectMapper) {
         this.dorisClient = dorisClient;
         this.nameSanitizer = nameSanitizer;
+        this.sourceTableNameService = sourceTableNameService;
         this.configParser = configParser;
         this.watermarkRepository = watermarkRepository;
         this.jdbcConnector = jdbcConnector;
@@ -310,13 +313,19 @@ public class SinkWriteService {
                                 String[] bodyKeys, boolean hasSeqColumn, long seqBase,
                                 String label, LogSink logSink) {
         byte[] body = buildJsonBody(config, rows, sourceIndexes, bodyKeys, hasSeqColumn, seqBase);
+        RuntimeException loadDetail = null;
         for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             try {
                 dorisClient.streamLoad(target, config.getTableName(), body, label, jsonPaths, 1800);
                 return rows.size();
             } catch (RuntimeException e) {
+                String detailMessage = safe(e);
+                if (detailMessage.contains("_load_error_log")
+                        || detailMessage.contains("ErrorURL")) {
+                    loadDetail = e;
+                }
                 if (attempt >= MAX_ATTEMPTS) {
-                    throw sinkWriteFailed(config, label, e);
+                    throw sinkWriteFailed(config, label, loadDetail == null ? e : loadDetail);
                 }
                 String message = "Stream Load 第 " + attempt + " 次失败：label=" + label
                         + "，目标=" + config.targetLabel() + "，delayMs=" + backoff(attempt)
@@ -816,7 +825,7 @@ public class SinkWriteService {
                         "上游 Source 节点未配置数据源或表：" + upstream.id(),
                         java.util.Collections.singletonMap("nodeId", upstream.id()));
             }
-            return nameSanitizer.sourceTable(dsId, table.trim());
+            return sourceTableNameService.resolve(flowId, dsId, table.trim());
         }
         if ("sink".equals(upstream.type())) {
             throw new BizException(ErrorCode.DAG_INVALID, "Sink 节点不能作为 Sink 的上游",
@@ -869,6 +878,10 @@ public class SinkWriteService {
         if (!config.getTargetType().equals(dsType)) {
             throw SinkConfigParser.invalid(config.getNodeId(), "TARGET_TYPE_MISMATCH",
                     "目标类型 " + config.getTargetType() + " 与所选数据源类型 " + dsType + " 不一致");
+        }
+        if (config.isDoris() && dorisClient.configuredHttpPort(ds) == null) {
+            throw SinkConfigParser.invalid(config.getNodeId(), "STREAM_LOAD_PORT_MISSING",
+                    DorisClient.STREAM_LOAD_PORT_MISSING_MESSAGE);
         }
         return ds;
     }

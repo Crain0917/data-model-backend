@@ -247,6 +247,7 @@ public class FlowService {
                         flowId, table, e.getMessage());
             }
         }
+        reconcileSourceTables(flowId, dag);
         // 被删节点若曾是 Sink，清理其水位线；目标表不在此删除。
         try {
             for (SinkWatermarkEntity mark : sinkWatermarkRepository.listByFlow(flowId)) {
@@ -259,6 +260,77 @@ public class FlowService {
             }
         } catch (RuntimeException e) {
             log.warn("保存画布清理水位线失败 flow={}：{}", flowId, e.getMessage());
+        }
+    }
+
+    /**
+     * 保存画布时对账清理本任务的 dm_src_{flowId}_*：仅保留当前 DAG 仍引用的源表副本。
+     * 历史 dm_src_{dsId}_* 基线表不在本任务命名空间内，绝不在清理范围内。
+     */
+    private void reconcileSourceTables(Long flowId, Dag dag) {
+        Set<String> keepKeys = new LinkedHashSet<>();
+        for (DagNode node : dag.nodeList()) {
+            if (!"source".equals(node.type())) {
+                continue;
+            }
+            Long dsId = node.longValue("dataSourceId");
+            String table = node.text("tableName", null);
+            if (dsId != null && table != null && !table.trim().isEmpty()) {
+                keepKeys.add(sourceKey(dsId, table));
+            }
+        }
+        Set<String> keepTables = new LinkedHashSet<>();
+        List<TableRegistryEntity> rows;
+        try {
+            rows = tableRegistryMapper.selectList(new LambdaQueryWrapper<TableRegistryEntity>()
+                    .eq(TableRegistryEntity::getFlowId, flowId)
+                    .eq(TableRegistryEntity::getKind, "SRC"));
+        } catch (RuntimeException e) {
+            log.warn("保存画布读取源表登记失败 flow={}：{}", flowId, e.getMessage());
+            return;
+        }
+        for (TableRegistryEntity row : rows) {
+            if (row.getDsId() != null && row.getSrcTable() != null
+                    && keepKeys.contains(sourceKey(row.getDsId(), row.getSrcTable()))) {
+                keepTables.add(row.getDorisTable());
+            }
+        }
+
+        List<String> existing;
+        try {
+            existing = dorisClient.listTablesWithPrefix(nameSanitizer.sourceTablePrefix(flowId));
+        } catch (RuntimeException e) {
+            log.warn("保存画布读取源表副本清单失败 flow={}，源表保留：{}", flowId, e.getMessage());
+            return;
+        }
+        Set<String> dropped = new LinkedHashSet<>();
+        for (String table : existing) {
+            if (keepTables.contains(table)) {
+                continue;
+            }
+            try {
+                dorisClient.dropTable(table);
+                dropped.add(table);
+                log.info("保存画布清理不再引用的源表副本 flow={} table={}", flowId, table);
+            } catch (RuntimeException e) {
+                log.warn("保存画布清理源表副本失败 flow={} table={}：{}", flowId, table, e.getMessage());
+            }
+        }
+        for (TableRegistryEntity row : rows) {
+            if (keepTables.contains(row.getDorisTable())) {
+                continue;
+            }
+            if (row.getDorisTable() != null && !row.getDorisTable().isEmpty()
+                    && !dropped.contains(row.getDorisTable())
+                    && existing.contains(row.getDorisTable())) {
+                continue;
+            }
+            try {
+                tableRegistryMapper.deleteById(row.getId());
+            } catch (RuntimeException e) {
+                log.warn("保存画布清理源表登记失败 flow={} table={}：{}",
+                        flowId, row.getDorisTable(), e.getMessage());
+            }
         }
     }
 
@@ -333,11 +405,16 @@ public class FlowService {
             throw SinkConfigParser.invalid(config.getNodeId(), "TARGET_TYPE_MISMATCH",
                     "目标类型 " + config.getTargetType() + " 与所选数据源类型 " + dsType + " 不一致");
         }
+        if (config.isDoris() && dorisClient.configuredHttpPort(ds) == null) {
+            throw SinkConfigParser.invalid(config.getNodeId(), "STREAM_LOAD_PORT_MISSING",
+                    DorisClient.STREAM_LOAD_PORT_MISSING_MESSAGE);
+        }
     }
 
     /**
      * 删除任务（M3.6 §12）：先 DROP 本 flow 的物化表并收集失败，再清理元数据。
-     * dm_mid_{flowId}_* 全删；dm_src_{dsId}_{table} 仅当无其他 flow 引用时删。
+     * dm_mid_{flowId}_* 与本 flow 专属的 dm_src_{flowId}_* 全删；
+     * 历史 dm_src_{dsId}_* 基线表不改动。
      */
     @Transactional
     public FlowDeleteResult delete(Long id, String confirmName) {
@@ -360,7 +437,7 @@ public class FlowService {
         }
 
         Set<String> middleTables = middleTables(id, dag);
-        Set<String> sourceTables = sourceTablesToDrop(id, dag);
+        Set<String> sourceTables = sourceTablesToDrop(id);
 
         FlowDeleteResult result = new FlowDeleteResult();
         dropTables(id, middleTables, result);
@@ -404,60 +481,28 @@ public class FlowService {
         return tables;
     }
 
-    private Set<String> sourceTablesToDrop(Long flowId, Dag dag) {
+    /** 本 flow 专属源表副本：registry 中登记 + Doris 中 dm_src_{flowId}_ 前缀的实际表。 */
+    private Set<String> sourceTablesToDrop(Long flowId) {
         Set<String> tables = new LinkedHashSet<>();
-        if (dag == null) {
-            return tables;
+        try {
+            List<TableRegistryEntity> registry = tableRegistryMapper.selectList(
+                    new LambdaQueryWrapper<TableRegistryEntity>()
+                            .eq(TableRegistryEntity::getFlowId, flowId)
+                            .eq(TableRegistryEntity::getKind, "SRC"));
+            for (TableRegistryEntity entity : registry) {
+                if (StringUtils.hasText(entity.getDorisTable())) {
+                    tables.add(entity.getDorisTable());
+                }
+            }
+        } catch (RuntimeException e) {
+            log.warn("读取源表登记失败 flow={}：{}", flowId, e.getMessage());
         }
-        Set<String> referencedElsewhere = referencedSourceKeys(flowId);
-        for (DagNode node : dag.nodeList()) {
-            if (!"source".equals(node.type())) {
-                continue;
-            }
-            Long dsId = node.longValue("dataSourceId");
-            String table = node.text("tableName", null);
-            if (dsId == null || table == null || table.trim().isEmpty()) {
-                continue;
-            }
-            String key = sourceKey(dsId, table);
-            if (!referencedElsewhere.contains(key)) {
-                tables.add(nameSanitizer.sourceTable(dsId, table.trim()));
-            }
+        try {
+            tables.addAll(dorisClient.listTablesWithPrefix(nameSanitizer.sourceTablePrefix(flowId)));
+        } catch (RuntimeException e) {
+            log.warn("读取源表副本清单失败 flow={}：{}", flowId, e.getMessage());
         }
         return tables;
-    }
-
-    /** 其余 flow 的 Source 引用集合；任一 flow 画布解析失败时保守保留源表。 */
-    private Set<String> referencedSourceKeys(Long excludedFlowId) {
-        Set<String> keys = new LinkedHashSet<>();
-        List<FlowEntity> flows;
-        try {
-            flows = flowMapper.selectList(new LambdaQueryWrapper<FlowEntity>()
-                    .ne(FlowEntity::getId, excludedFlowId));
-        } catch (RuntimeException e) {
-            log.warn("扫描其他任务引用失败，源表按保留处理：{}", e.getMessage());
-            return keys;
-        }
-        for (FlowEntity other : flows) {
-            Dag otherDag;
-            try {
-                otherDag = Dag.parse(parseDag(other));
-            } catch (RuntimeException e) {
-                log.warn("任务 {} 画布无法解析，其 Source 引用无法判定", other.getId());
-                continue;
-            }
-            for (DagNode node : otherDag.nodeList()) {
-                if (!"source".equals(node.type())) {
-                    continue;
-                }
-                Long dsId = node.longValue("dataSourceId");
-                String table = node.text("tableName", null);
-                if (dsId != null && table != null && !table.trim().isEmpty()) {
-                    keys.add(sourceKey(dsId, table));
-                }
-            }
-        }
-        return keys;
     }
 
     private static String sourceKey(Long dsId, String table) {
@@ -553,7 +598,7 @@ public class FlowService {
             LambdaQueryWrapper<TableRegistryEntity> registryQuery =
                     new LambdaQueryWrapper<TableRegistryEntity>()
                             .eq(TableRegistryEntity::getFlowId, flowId)
-                            .eq(TableRegistryEntity::getKind, "MID");
+                            .in(TableRegistryEntity::getKind, "MID", "SRC");
             if (!result.getFailedTables().isEmpty()) {
                 List<String> failed = result.getFailedTables().stream()
                         .map(FlowDeleteResult.FailedTable::getDorisTable)

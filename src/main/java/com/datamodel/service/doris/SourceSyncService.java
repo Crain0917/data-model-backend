@@ -48,19 +48,22 @@ public class SourceSyncService {
     private final TypeMappingRegistry typeMappingRegistry;
     private final DorisNameSanitizer nameSanitizer;
     private final DorisRegistryRepository registryRepository;
+    private final SourceTableNameService sourceTableNameService;
 
     public SourceSyncService(DorisProperties props,
                              DorisClient dorisClient,
                              JdbcConnector jdbcConnector,
                              TypeMappingRegistry typeMappingRegistry,
                              DorisNameSanitizer nameSanitizer,
-                             DorisRegistryRepository registryRepository) {
+                             DorisRegistryRepository registryRepository,
+                             SourceTableNameService sourceTableNameService) {
         this.props = props;
         this.dorisClient = dorisClient;
         this.jdbcConnector = jdbcConnector;
         this.typeMappingRegistry = typeMappingRegistry;
         this.nameSanitizer = nameSanitizer;
         this.registryRepository = registryRepository;
+        this.sourceTableNameService = sourceTableNameService;
     }
 
     /**
@@ -80,7 +83,7 @@ public class SourceSyncService {
         List<ColumnInfo> chosen = chooseColumns(allColumns, selectedColumns);
         List<TargetColumn> targets = mapColumns(ds.getType(), chosen);
         String fingerprint = fingerprint(targets);
-        String dorisTable = nameSanitizer.sourceTable(ds.getId(), table);
+        String dorisTable = sourceTableNameService.resolve(flowId, ds.getId(), table);
 
         boolean recreated = prepareTarget(dorisTable, fingerprint, targets);
 
@@ -97,8 +100,8 @@ public class SourceSyncService {
         TableRegistryEntity registry = new TableRegistryEntity();
         registry.setDorisTable(dorisTable);
         registry.setKind("SRC");
-        registry.setFlowId(null);
-        registry.setNodeId(null);
+        registry.setFlowId(flowId);
+        registry.setNodeId(nodeId);
         registry.setDsId(ds.getId());
         registry.setSrcTable(table);
         registry.setSchemaFingerprint(fingerprint);

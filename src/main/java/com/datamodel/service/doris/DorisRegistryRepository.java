@@ -37,6 +37,44 @@ public class DorisRegistryRepository {
         }
     }
 
+    /** 按任务 + 数据源 + 源表查找已生成的源表名（大小写不敏感）。 */
+    public TableRegistryEntity findSrc(long flowId, long dsId, String srcTable) {
+        if (srcTable == null || srcTable.trim().isEmpty()) {
+            return null;
+        }
+        try {
+            return registryMapper.selectOne(new LambdaQueryWrapper<TableRegistryEntity>()
+                    .eq(TableRegistryEntity::getKind, "SRC")
+                    .eq(TableRegistryEntity::getFlowId, flowId)
+                    .eq(TableRegistryEntity::getDsId, dsId)
+                    .apply("LOWER(src_table) = {0}", srcTable.trim().toLowerCase())
+                    .orderByAsc(TableRegistryEntity::getId)
+                    .last("LIMIT 1"));
+        } catch (Exception e) {
+            log.warn("读取源表登记失败（表可能未创建）：{}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * 仅插入新的源表登记；doris_table 唯一键冲突返回 false。
+     * 其他元数据异常返回 true（名称仍可本次使用，避免阻断同步）。
+     */
+    public boolean insertIfAbsent(TableRegistryEntity entity) {
+        LocalDateTime now = LocalDateTime.now();
+        entity.setCreateTime(now);
+        entity.setUpdateTime(now);
+        try {
+            registryMapper.insert(entity);
+            return true;
+        } catch (org.springframework.dao.DuplicateKeyException e) {
+            return false;
+        } catch (Exception e) {
+            log.warn("写源表登记失败（表可能未创建）：{}", e.getMessage());
+            return true;
+        }
+    }
+
     public void upsert(TableRegistryEntity entity) {
         try {
             TableRegistryEntity existing = find(entity.getDorisTable());
