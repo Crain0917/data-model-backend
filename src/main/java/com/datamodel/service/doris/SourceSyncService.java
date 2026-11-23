@@ -177,18 +177,25 @@ public class SourceSyncService {
         return result;
     }
 
-    private boolean prepareTarget(String dorisTable, String fingerprint, List<TargetColumn> targets) {
-        boolean exists = dorisClient.tableExists(dorisTable);
+    /**
+     * 源表副本一律「先清理再重建」：information_schema 可能与物理元数据漂移
+     * （瞬时查询失败被吞成不存在、DROP 后可见性延迟），若先 CREATE 会撞「src 表已存在」。
+     * DROP TABLE IF EXISTS 同时清理残留表；CREATE 撞已存在时由 DorisClient.createTable 再重试一次。
+     *
+     * @return 是否因表结构变化而重建（供日志提示，不影响是否物理重建）
+     */
+    boolean prepareTarget(String dorisTable, String fingerprint, List<TargetColumn> targets) {
         boolean changed = false;
-        if (exists) {
+        if (dorisClient.tableExists(dorisTable)) {
             TableRegistryEntity registry = registryRepository.find(dorisTable);
-            if (registry != null && fingerprint.equals(registry.getSchemaFingerprint())) {
-                dorisClient.truncate(dorisTable);
-                return false;
-            }
-            dorisClient.dropTable(dorisTable);
-            changed = true;
+            changed = registry == null || !fingerprint.equals(registry.getSchemaFingerprint());
         }
+        dorisClient.dropTable(dorisTable);
+        dorisClient.createTable(buildCreateDdl(dorisTable, targets), dorisTable);
+        return changed;
+    }
+
+    private String buildCreateDdl(String dorisTable, List<TargetColumn> targets) {
         StringBuilder ddl = new StringBuilder("CREATE TABLE ").append(dorisClient.qualified(dorisTable)).append(" (\n")
                 .append("  `__dm_rowid` BIGINT NOT NULL");
         for (TargetColumn c : targets) {
@@ -197,8 +204,7 @@ public class SourceSyncService {
         }
         ddl.append("\n) DUPLICATE KEY(`__dm_rowid`) DISTRIBUTED BY HASH(`__dm_rowid`) BUCKETS 1 ")
                 .append("PROPERTIES (\"replication_num\" = \"1\")");
-        dorisClient.execute(ddl.toString());
-        return changed;
+        return ddl.toString();
     }
 
     private long countSource(DataSourceEntity ds, String plainPassword, String table, List<Condition> filters) {

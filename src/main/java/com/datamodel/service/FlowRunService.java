@@ -14,6 +14,7 @@ import com.datamodel.domain.FlowEntity;
 import com.datamodel.domain.FlowRunEntity;
 import com.datamodel.domain.NodeRunEntity;
 import com.datamodel.domain.RunLogEntity;
+import com.datamodel.domain.TableRegistryEntity;
 import com.datamodel.dto.FlowRunVO;
 import com.datamodel.dto.NodeLogsVO;
 import com.datamodel.dto.NodeRunVO;
@@ -22,6 +23,8 @@ import com.datamodel.mapper.FlowMapper;
 import com.datamodel.mapper.FlowRunMapper;
 import com.datamodel.mapper.NodeRunMapper;
 import com.datamodel.mapper.RunLogMapper;
+import com.datamodel.service.doris.DorisClient;
+import com.datamodel.service.doris.DorisRegistryRepository;
 import com.datamodel.service.doris.MaterializeResult;
 import com.datamodel.service.doris.SourceSyncService;
 import com.datamodel.service.doris.MaterializeService;
@@ -70,6 +73,8 @@ public class FlowRunService {
     private final SqlBuilderFactory sqlBuilderFactory;
     private final SinkWriteService sinkWriteService;
     private final SinkWatermarkRepository sinkWatermarkRepository;
+    private final DorisRegistryRepository registryRepository;
+    private final DorisClient dorisClient;
     private final ExecutorService executor;
 
     private final Set<Long> runningFlows = ConcurrentHashMap.newKeySet();
@@ -86,6 +91,8 @@ public class FlowRunService {
                           SqlBuilderFactory sqlBuilderFactory,
                           SinkWriteService sinkWriteService,
                           SinkWatermarkRepository sinkWatermarkRepository,
+                          DorisRegistryRepository registryRepository,
+                          DorisClient dorisClient,
                           @Qualifier("flowRunExecutor") ExecutorService executor) {
         this.flowService = flowService;
         this.flowMapper = flowMapper;
@@ -99,6 +106,8 @@ public class FlowRunService {
         this.sqlBuilderFactory = sqlBuilderFactory;
         this.sinkWriteService = sinkWriteService;
         this.sinkWatermarkRepository = sinkWatermarkRepository;
+        this.registryRepository = registryRepository;
+        this.dorisClient = dorisClient;
         this.executor = executor;
     }
 
@@ -111,7 +120,64 @@ public class FlowRunService {
             throw new BizException(ErrorCode.PARAM_ERROR, "画布为空，无法执行");
         }
         List<String> order = FlowValidation.topologicalOrder(dag, dag.nodes().keySet());
-        return submit(flow, dagJson, dag, order, "FULL", null, false);
+        return submit(flow, dagJson, dag, order, "FULL", null, false, null);
+    }
+
+    /**
+     * 中间任务：不访问源库、不重新 Stream Load，source 节点记录为 SKIPPED，
+     * 其余节点按拓扑顺序重跑。前置校验先于创建 run，缺失副本不自动同步。
+     */
+    public Long startMiddleRun(Long flowId) {
+        FlowEntity flow = flowService.getEntity(flowId);
+        JsonNode dagJson = flowService.parseDag(flow);
+        FlowValidation.validate(dagJson);
+        Dag dag = Dag.parse(dagJson);
+        if (dag.nodeList().isEmpty()) {
+            throw new BizException(ErrorCode.PARAM_ERROR, "画布为空，无法执行");
+        }
+        Map<String, String> sourceTables = precheckSourceCopies(flowId, dag);
+        List<String> order = FlowValidation.topologicalOrder(dag, dag.nodes().keySet());
+        return submit(flow, dagJson, dag, order, "MIDDLE", null, false, sourceTables);
+    }
+
+    /**
+     * 中间任务前置校验：每个 source 节点都必须有 READY 的 SRC 登记且 Doris 物理表存在。
+     * 在创建 run 之前失败，绝不自动同步。
+     */
+    private Map<String, String> precheckSourceCopies(long flowId, Dag dag) {
+        Map<String, String> tables = new LinkedHashMap<>();
+        for (DagNode node : dag.nodeList()) {
+            if (!"source".equals(node.type())) {
+                continue;
+            }
+            Long dsId = node.longValue("dataSourceId");
+            String srcTable = node.text("tableName", null);
+            String label = srcTable == null || srcTable.trim().isEmpty() ? "未配置" : srcTable.trim();
+            if (dsId == null || srcTable == null || srcTable.trim().isEmpty()) {
+                throw sourceCopyMissing(node.id(), label);
+            }
+            TableRegistryEntity registry = registryRepository.findSrc(flowId, dsId, srcTable.trim());
+            if (registry == null || registry.getDorisTable() == null
+                    || registry.getDorisTable().trim().isEmpty()
+                    || !"READY".equalsIgnoreCase(registry.getStatus())) {
+                throw sourceCopyMissing(node.id(), label);
+            }
+            if (!dorisClient.tableExistsStrict(registry.getDorisTable())) {
+                throw sourceCopyMissing(node.id(), label);
+            }
+            tables.put(node.id(), registry.getDorisTable());
+        }
+        return tables;
+    }
+
+    private static BizException sourceCopyMissing(String nodeId, String table) {
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("nodeId", nodeId);
+        data.put("table", table);
+        data.put("reason", "SOURCE_COPY_MISSING");
+        return new BizException(ErrorCode.PARAM_ERROR,
+                "源表副本缺失（节点 " + nodeId + " / 表 " + table
+                        + "），请先执行『运行任务』完成源表同步", data);
     }
 
     public Long startNodeRun(Long flowId, String nodeId) {
@@ -144,12 +210,12 @@ public class FlowRunService {
         List<String> order = reuseUpstream
                 ? Collections.singletonList(nodeId)
                 : FlowValidation.executionOrder(dag, nodeId);
-        return submit(flow, dagJson, dag, order, "NODE", nodeId, reuseUpstream);
+        return submit(flow, dagJson, dag, order, "NODE", nodeId, reuseUpstream, null);
     }
 
     private Long submit(FlowEntity flow, JsonNode dagJson, Dag dag,
                         List<String> order, String runType, String targetNodeId,
-                        boolean reuseUpstream) {
+                        boolean reuseUpstream, Map<String, String> middleSourceTables) {
         if (!runningFlows.add(flow.getId())) {
             throw new BizException(ErrorCode.RUN_CONFLICT, "任务正在执行，请等待当前执行结束");
         }
@@ -173,15 +239,21 @@ public class FlowRunService {
             run.setCreateTime(now);
             flowRunMapper.insert(run);
 
+            String runLabel = "NODE".equals(runType) ? "单节点 " + targetNodeId
+                    : "MIDDLE".equals(runType) ? "中间任务（不重新同步源表）" : "整任务";
             writeLog(run.getId(), null, "INFO",
-                    "开始执行（" + ("NODE".equals(runType) ? "单节点 " + targetNodeId : "整任务")
-                            + "），共 " + order.size() + " 个节点");
+                    "开始执行（" + runLabel + "），共 " + order.size() + " 个节点");
+            if (middleSourceTables != null && !middleSourceTables.isEmpty()) {
+                writeLog(run.getId(), null, "INFO",
+                        "中间任务：跳过 " + middleSourceTables.size() + " 个 source 节点的源表同步");
+            }
             if (clearedWatermarks > 0) {
                 writeLog(run.getId(), null, "INFO",
                         "整任务重跑：已重置 " + clearedWatermarks + " 条 Sink 水位线");
             }
 
-            executor.execute(() -> execute(run, dagJson, dag, order, reuseUpstream));
+            executor.execute(() -> execute(run, dagJson, dag, order, reuseUpstream,
+                    middleSourceTables));
             return run.getId();
         } catch (RuntimeException e) {
             runningFlows.remove(flow.getId());
@@ -190,7 +262,7 @@ public class FlowRunService {
     }
 
     private void execute(FlowRunEntity run, JsonNode dagJson, Dag dag, List<String> order,
-                         boolean reuseUpstream) {
+                         boolean reuseUpstream, Map<String, String> middleSourceTables) {
         long start = System.currentTimeMillis();
         String status = "SUCCESS";
         String error = null;
@@ -198,6 +270,10 @@ public class FlowRunService {
             for (String nodeId : order) {
                 DagNode node = dag.node(nodeId);
                 if (node == null) {
+                    continue;
+                }
+                if (middleSourceTables != null && "source".equals(node.type())) {
+                    recordSkippedSource(run, node, middleSourceTables.get(nodeId));
                     continue;
                 }
                 runNode(run, dagJson, node, reuseUpstream);
@@ -279,6 +355,28 @@ public class FlowRunService {
             nr.setCostMs(System.currentTimeMillis() - start);
             nodeRunMapper.updateById(nr);
         }
+    }
+
+    /** 中间任务：source 节点不访问源库、不 Stream Load，回填已同步副本表并记为 SKIPPED。 */
+    private void recordSkippedSource(FlowRunEntity run, DagNode node, String targetTable) {
+        LocalDateTime now = LocalDateTime.now();
+        NodeRunEntity nr = new NodeRunEntity();
+        nr.setFlowRunId(run.getId());
+        nr.setFlowId(run.getFlowId());
+        nr.setNodeId(node.id());
+        nr.setNodeType(node.type());
+        nr.setNodeName(node.label() == null || node.label().trim().isEmpty() ? node.id() : node.label());
+        nr.setStatus("SKIPPED");
+        nr.setTargetTable(targetTable);
+        nr.setRowCount(0L);
+        nr.setCostMs(0L);
+        nr.setSqlText("复用已同步源表 " + targetTable + "（中间任务不重新同步）");
+        nr.setStartTime(now);
+        nr.setEndTime(now);
+        nr.setCreateTime(now);
+        nodeRunMapper.insert(nr);
+        writeLog(run.getId(), node.id(), "INFO",
+                "中间任务：跳过源表同步，复用已同步副本表 " + targetTable);
     }
 
     private void runSource(FlowRunEntity run, DagNode node, NodeRunEntity nr) {

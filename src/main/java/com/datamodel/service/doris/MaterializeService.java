@@ -24,8 +24,8 @@ import java.util.Locale;
 import java.util.Set;
 
 /**
- * 中间节点物化：CREATE TABLE IF NOT EXISTS + INSERT OVERWRITE ... SELECT。
- * 失败回退 TRUNCATE + INSERT INTO ... SELECT（与设计 §1.3 语义等价）。
+ * 中间节点物化：按需建表 + INSERT OVERWRITE ... SELECT。
+ * 表结构未变时复用；结构变化或残留表时 DROP 后重建，CREATE 竞态自动重试一次。
  */
 @Service
 public class MaterializeService {
@@ -94,7 +94,12 @@ public class MaterializeService {
         return result;
     }
 
-    private boolean prepareTarget(String target, String fingerprint, List<DdlColumn> columns) {
+    /**
+     * 表结构未变时保留表直接 INSERT OVERWRITE；结构变化或残留表则 DROP 后重建。
+     * information_schema 与物理元数据漂移导致 CREATE 撞「已存在」时，
+     * 由 DorisClient.createTable 自动 DROP 并重试一次。
+     */
+    boolean prepareTarget(String target, String fingerprint, List<DdlColumn> columns) {
         boolean exists = dorisClient.tableExists(target);
         boolean changed = false;
         if (exists) {
@@ -105,6 +110,11 @@ public class MaterializeService {
             dorisClient.dropTable(target);
             changed = true;
         }
+        dorisClient.createTable(buildCreateDdl(target, columns), target);
+        return changed;
+    }
+
+    private String buildCreateDdl(String target, List<DdlColumn> columns) {
         StringBuilder ddl = new StringBuilder("CREATE TABLE ").append(dorisClient.qualified(target)).append(" (\n")
                 .append("  `__dm_rowid` BIGINT NOT NULL");
         for (DdlColumn c : columns) {
@@ -113,8 +123,7 @@ public class MaterializeService {
         }
         ddl.append("\n) DUPLICATE KEY(`__dm_rowid`) DISTRIBUTED BY HASH(`__dm_rowid`) BUCKETS 1 ")
                 .append("PROPERTIES (\"replication_num\" = \"1\")");
-        dorisClient.execute(ddl.toString());
-        return changed;
+        return ddl.toString();
     }
 
     private void execute(String parameterized, String display, List<Object> params) {

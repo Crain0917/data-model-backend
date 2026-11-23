@@ -30,7 +30,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
-import javax.validation.Valid;
+import jakarta.validation.Valid;
 import java.util.Collections;
 
 @RestController
@@ -97,6 +97,14 @@ public class FlowController {
     @PostMapping("/{id}/run")
     public ResponseEntity<ApiResponse<Object>> run(@PathVariable Long id) {
         Long runId = flowRunService.startFlowRun(id);
+        return ResponseEntity.status(HttpStatus.ACCEPTED)
+                .body(ApiResponse.ok(Collections.singletonMap("runId", runId)));
+    }
+
+    /** 中间任务：不重新同步 source，只重跑其余节点；前置校验源表副本。 */
+    @PostMapping("/{id}/run-middle")
+    public ResponseEntity<ApiResponse<Object>> runMiddle(@PathVariable Long id) {
+        Long runId = flowRunService.startMiddleRun(id);
         return ResponseEntity.status(HttpStatus.ACCEPTED)
                 .body(ApiResponse.ok(Collections.singletonMap("runId", runId)));
     }

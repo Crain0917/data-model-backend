@@ -10,10 +10,10 @@ Spring Boot 单体后端。已完成 **M1 数据源域**（CRUD、连通性测�
 
 | 依赖 | 版本 | 说明 |
 |---|---|---|
-| JDK | 1.8 | 编译与运行 |
-| Spring Boot | 2.7.18 | Web / Validation |
-| MyBatis-Plus | 3.5.5 | 元数据 CRUD |
-| MySQL Connector/J | 8.0.33 | MySQL、Doris |
+| JDK | 21 | 编译与运行（已在 Temurin 21.0.13 验证） |
+| Spring Boot | 3.5.7 | Web / Validation |
+| MyBatis-Plus | 3.5.12 | 元数据 CRUD（`mybatis-plus-spring-boot3-starter`） |
+| MySQL Connector/J | 8.0.33 | MySQL、Doris（`com.mysql:mysql-connector-j`） |
 | DmJdbcDriver18 | 8.1.3.62 | 达梦 DM8 |
 | H2 | 2.2.224 | 仅 `local` 配置自测 |
 | Maven | 3.6+ | 构建 |
@@ -99,11 +99,22 @@ $env:AES_KEY = [Convert]::ToBase64String($bytes)
 
 ## 4. 构建与启动
 
+需要 **JDK 21**（Spring Boot 3.5.x 不支持 JDK 8）。构建前确认 `JAVA_HOME` 指向 JDK 21：
+
 ```bash
+export JAVA_HOME=/path/to/jdk-21
+mvn -version   # 应显示 Java version: 21.x
 mvn clean package
 ```
 
-产物：`target/data-model-backend.jar`
+Windows（Git Bash / PowerShell）：
+
+```bat
+set JAVA_HOME=D:\basic_component\JDK\21
+mvn clean package
+```
+
+产物：`target/data-model-backend.jar`（运行时同样使用 JDK 21）。
 
 启动（示例，密码由 shell 环境提供，不写进命令历史或文档）：
 

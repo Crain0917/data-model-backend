@@ -378,6 +378,37 @@ public class DorisClient {
         execute("DROP TABLE IF EXISTS " + qualified(table));
     }
 
+    /**
+     * CREATE TABLE，撞「已存在」时说明 information_schema 可见性与物理元数据漂移，
+     * DROP TABLE IF EXISTS 后重试一次；其他错误原样抛出。
+     */
+    public void createTable(String ddl, String table) {
+        try {
+            execute(ddl);
+        } catch (BizException e) {
+            if (!isTableAlreadyExists(e)) {
+                throw e;
+            }
+            log.warn("CREATE TABLE 命中已存在（元数据竞态），DROP 后重试一次 table={}", table);
+            dropTable(table);
+            sleepQuietly(300L);
+            execute(ddl);
+        }
+    }
+
+    static boolean isTableAlreadyExists(BizException e) {
+        String message = e.getMessage() == null ? "" : e.getMessage().toLowerCase(Locale.ROOT);
+        return message.contains("already exists") || message.contains("已存在");
+    }
+
+    private static void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     public long tableRowCount(String table) {
         return queryLong("SELECT COUNT(*) FROM " + qualified(table));
     }

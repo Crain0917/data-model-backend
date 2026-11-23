@@ -1382,19 +1382,6 @@ public class SqlBuilderFactory {
         return column == null ? null : Identifiers.ref(alias, column.getName(), q);
     }
 
-    /** 银行家舍入：恰好 .5 时取最近的偶数，其余按常规舍入；b 为空按 0 位小数。 */
-    private static String bankersRound(String a, String b) {
-        String decimals = b == null ? "0" : b;
-        String scaled = "(" + a + " * POW(10, " + decimals + "))";
-        String floor = "FLOOR(" + scaled + ")";
-        String fraction = "(" + scaled + " - " + floor + ")";
-        return "(" + floor
-                + " + CASE WHEN " + fraction + " > 0.5 THEN 1"
-                + " WHEN " + fraction + " < 0.5 THEN 0"
-                + " WHEN MOD(" + floor + ", 2) = 0 THEN 0 ELSE 1 END)"
-                + " / POW(10, " + decimals + ")";
-    }
-
     private static String calculatorExpression(CalculatorRow row, String a, String b, String c) {
         switch (row.operation) {
             case "ADD":
@@ -1417,9 +1404,10 @@ public class SqlBuilderFactory {
                 return "LEAST(" + a + ", " + b + ")";
             case "MAX":
                 return "GREATEST(" + a + ", " + b + ")";
-            // 当前 Doris 的 DROUND 与 ROUND 均为四舍五入，这里显式实现银行家舍入（半偶）。
+            // ROUND_BANKERS：半偶舍入（2.5→2、3.5→4、-2.5→-2），Doris 4.x 原生函数。
             case "ROUND":
-                return bankersRound(a, b);
+                return b == null ? "ROUND_BANKERS(" + a + ")" : "ROUND_BANKERS(" + a + ", " + b + ")";
+            // ROUND：半远离零（2.5→3、-2.5→-3），与 MySQL/Doris 一致。
             case "STDROUND":
                 return b == null ? "ROUND(" + a + ")" : "ROUND(" + a + ", " + b + ")";
             case "CEIL":
@@ -1467,7 +1455,8 @@ public class SqlBuilderFactory {
             case "DAY_OF_YEAR":
                 return "DAYOFYEAR(" + a + ")";
             case "WEEK_OF_YEAR":
-                return "WEEK(" + a + ")";
+                // WEEKOFYEAR：ISO 周（周一为周首、含 4 天以上为第 1 周，范围 1-53）。
+                return "WEEKOFYEAR(" + a + ")";
             case "QUARTER_OF_DATE":
                 return "QUARTER(" + a + ")";
             case "HOUR_OF_DAY":
