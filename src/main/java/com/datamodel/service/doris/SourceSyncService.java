@@ -27,9 +27,11 @@ import java.sql.ResultSetMetaData;
 import java.sql.Types;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -132,24 +134,33 @@ public class SourceSyncService {
         }
     }
 
+    /**
+     * 按 selected 的顺序输出列：用户在 Source 节点拖动字段后，Doris 副本表的列顺序
+     * 也必须跟随该顺序，因此不能按源库物理列顺序遍历。
+     */
     private List<ColumnInfo> chooseColumns(List<ColumnInfo> all, List<String> selected) {
         if (selected == null || selected.isEmpty()) {
             return all;
         }
+        Map<String, ColumnInfo> byName = new HashMap<>();
+        for (ColumnInfo c : all) {
+            byName.putIfAbsent(c.getName(), c);
+        }
         Set<String> wanted = new LinkedHashSet<>(selected);
         List<ColumnInfo> result = new ArrayList<>();
-        for (ColumnInfo c : all) {
-            if (wanted.contains(c.getName())) {
-                result.add(c);
+        Set<String> found = new LinkedHashSet<>();
+        for (String name : wanted) {
+            ColumnInfo c = byName.get(name);
+            if (c == null) {
+                continue;
             }
+            result.add(c);
+            found.add(name);
         }
         if (result.size() != wanted.size()) {
-            Set<String> found = new LinkedHashSet<>();
-            for (ColumnInfo c : result) {
-                found.add(c.getName());
-            }
-            wanted.removeAll(found);
-            throw new BizException(ErrorCode.PARAM_ERROR, "源表不存在这些字段：" + wanted);
+            List<String> missing = new ArrayList<>(wanted);
+            missing.removeAll(found);
+            throw new BizException(ErrorCode.PARAM_ERROR, "源表不存在这些字段：" + missing);
         }
         return result;
     }
