@@ -74,6 +74,14 @@ public class SqlBuilderFactory {
                 return buildCalculator(node, dag, flowId, missing);
             case "formula":
                 return buildFormula(node, dag, flowId, missing);
+            case "replace_null":
+                return buildReplaceNull(node, dag, flowId, missing);
+            case "sort_rows":
+                return buildSortRows(node, dag, flowId, missing);
+            case "split_fields":
+                return buildSplitFields(node, dag, flowId, missing);
+            case "split_fields_to_rows":
+                return buildSplitFieldsToRows(node, dag, flowId, missing);
             case "sink":
                 return buildSink(node);
             default:
@@ -569,6 +577,786 @@ public class SqlBuilderFactory {
         return r;
     }
 
+    // ------------------------------------------------------- replace null
+
+    private static final Set<String> REPLACE_STRATEGIES = new LinkedHashSet<>(
+            java.util.Arrays.asList("VALUE", "MAX", "MIN", "AVG", "MEDIAN", "MODE"));
+
+    private static final class ReplaceRule {
+        final String field;
+        final String strategy;
+        final String value;
+        final String output;
+        final boolean treatEmptyAsNull;
+
+        ReplaceRule(String field, String strategy, String value, String output,
+                    boolean treatEmptyAsNull) {
+            this.field = field;
+            this.strategy = strategy;
+            this.value = value;
+            this.output = output;
+            this.treatEmptyAsNull = treatEmptyAsNull;
+        }
+
+        boolean inPlace(String columnName) {
+            return output.isEmpty() || output.equals(columnName);
+        }
+    }
+
+    private static boolean isNumericType(String type) {
+        String t = type == null ? "" : type.trim().toUpperCase(Locale.ROOT);
+        return t.startsWith("TINYINT") || t.startsWith("SMALLINT") || t.startsWith("INT")
+                || t.startsWith("INTEGER") || t.startsWith("BIGINT") || t.startsWith("LARGEINT")
+                || t.startsWith("FLOAT") || t.startsWith("DOUBLE") || t.startsWith("DECIMAL")
+                || t.startsWith("NUMERIC");
+    }
+
+    private static boolean isStringType(String type) {
+        String t = type == null ? "" : type.trim().toUpperCase(Locale.ROOT);
+        return t.startsWith("STRING") || t.startsWith("VARCHAR") || t.startsWith("CHAR")
+                || t.startsWith("TEXT");
+    }
+
+    private static boolean isNumericLiteral(String value) {
+        if (value == null) {
+            return false;
+        }
+        String v = value.trim();
+        if (v.isEmpty()) {
+            return false;
+        }
+        try {
+            new java.math.BigDecimal(v);
+            return true;
+        } catch (NumberFormatException e) {
+            return false;
+        }
+    }
+
+    private List<ReplaceRule> parseReplaceRules(DagNode node) {
+        List<ReplaceRule> rules = new ArrayList<>();
+        JsonNode arr = node.array("rules");
+        if (arr == null) {
+            return rules;
+        }
+        for (JsonNode r : arr) {
+            rules.add(new ReplaceRule(
+                    r.path("field").asText("").trim(),
+                    r.path("strategy").asText("").trim().toUpperCase(Locale.ROOT),
+                    r.hasNonNull("value") ? r.get("value").asText() : null,
+                    r.path("output").asText("").trim(),
+                    r.path("treatEmptyAsNull").asBoolean(false)));
+        }
+        return rules;
+    }
+
+    private static ReplaceRule findReplaceRule(List<ReplaceRule> rules, String column) {
+        for (ReplaceRule rule : rules) {
+            if (rule.field.equalsIgnoreCase(column)) {
+                return rule;
+            }
+        }
+        return null;
+    }
+
+    private static String replaceOutputType(ReplaceRule rule, OutputColumn column) {
+        if ("AVG".equals(rule.strategy) || "MEDIAN".equals(rule.strategy)) {
+            return "DOUBLE";
+        }
+        return column.getDorisType();
+    }
+
+    private void validateReplaceRules(DagNode node, List<ReplaceRule> rules,
+                                      List<OutputColumn> upCols) {
+        if (upCols.isEmpty()) {
+            throw paramError(node, "REPLACE_UPSTREAM_UNKNOWN",
+                    "替换缺失值无法确定上游字段，请先配置上游节点并获取字段");
+        }
+        if (rules.isEmpty()) {
+            throw paramError(node, "REPLACE_RULES_EMPTY",
+                    "替换缺失值至少需要配置一条规则");
+        }
+        Set<String> fields = new LinkedHashSet<>();
+        Set<String> outputs = new LinkedHashSet<>();
+        for (OutputColumn column : upCols) {
+            outputs.add(column.getName().toLowerCase(Locale.ROOT));
+        }
+        for (ReplaceRule rule : rules) {
+            if (rule.field.isEmpty()) {
+                throw paramError(node, "REPLACE_FIELD_MISSING",
+                        "替换缺失值的字段不能为空");
+            }
+            if (!fields.add(rule.field.toLowerCase(Locale.ROOT))) {
+                throw paramError(node, "REPLACE_RULE_DUPLICATE",
+                        "同一字段只能配置一条替换规则：" + rule.field);
+            }
+            OutputColumn column = findColumn(upCols, rule.field);
+            if (column == null) {
+                throw paramError(node, "REPLACE_FIELD_UNKNOWN",
+                        "替换缺失值引用了不存在的字段：" + rule.field);
+            }
+            if (!REPLACE_STRATEGIES.contains(rule.strategy)) {
+                throw paramError(node, "REPLACE_STRATEGY_INVALID",
+                        rule.strategy.isEmpty()
+                                ? "替换缺失值的策略不能为空"
+                                : "替换缺失值不支持的策略：" + rule.strategy);
+            }
+            boolean numeric = isNumericType(column.getDorisType());
+            if (!"VALUE".equals(rule.strategy) && !numeric) {
+                throw paramError(node, "REPLACE_STRATEGY_UNSUPPORTED",
+                        "字段 " + column.getName() + " 不是数字类型，只能选择自定义值");
+            }
+            if ("VALUE".equals(rule.strategy)) {
+                if (rule.value == null) {
+                    throw paramError(node, "REPLACE_VALUE_MISSING",
+                            "字段 " + column.getName() + " 的自定义替换值不能为空");
+                }
+                if (numeric && !isNumericLiteral(rule.value)) {
+                    throw paramError(node, "REPLACE_VALUE_INVALID",
+                            "字段 " + column.getName() + " 的自定义替换值必须是数字：" + rule.value);
+                }
+            }
+            if (rule.inPlace(column.getName())) {
+                continue;
+            }
+            String out = requireOutputName(node, rule.output, "REPLACE_OUTPUT_INVALID",
+                    "替换缺失值");
+            if (!outputs.add(out.toLowerCase(Locale.ROOT))) {
+                throw paramError(node, "REPLACE_OUTPUT_DUPLICATE",
+                        "替换缺失值输出字段重名：" + out);
+            }
+        }
+    }
+
+    private static String replaceExpression(ReplaceRule rule, OutputColumn column,
+                                            String alias, String upTable,
+                                            Identifiers.QuoteStyle q) {
+        String ref = Identifiers.ref(alias, column.getName(), q);
+        boolean numeric = isNumericType(column.getDorisType());
+        if ("VALUE".equals(rule.strategy)) {
+            String base = ref;
+            if (isStringType(column.getDorisType()) && rule.treatEmptyAsNull) {
+                base = "NULLIF(" + ref + ", '')";
+            }
+            String literal = numeric ? rule.value.trim() : stringLiteral(rule.value);
+            return "COALESCE(" + base + ", " + literal + ")";
+        }
+        String agg;
+        switch (rule.strategy) {
+            case "MAX":
+                agg = "SELECT MAX(" + Identifiers.quote(column.getName(), q)
+                        + ") FROM " + upTable + " AS `dm_agg`";
+                break;
+            case "MIN":
+                agg = "SELECT MIN(" + Identifiers.quote(column.getName(), q)
+                        + ") FROM " + upTable + " AS `dm_agg`";
+                break;
+            case "AVG":
+                agg = "SELECT AVG(" + Identifiers.quote(column.getName(), q)
+                        + ") FROM " + upTable + " AS `dm_agg`";
+                break;
+            case "MEDIAN":
+                agg = "SELECT PERCENTILE(" + Identifiers.quote(column.getName(), q)
+                        + ", 0.5) FROM " + upTable + " AS `dm_agg`";
+                break;
+            case "MODE":
+                agg = "SELECT " + Identifiers.quote(column.getName(), q)
+                        + " FROM " + upTable + " AS `dm_agg` WHERE "
+                        + Identifiers.quote(column.getName(), q)
+                        + " IS NOT NULL GROUP BY " + Identifiers.quote(column.getName(), q)
+                        + " ORDER BY COUNT(*) DESC, " + Identifiers.quote(column.getName(), q)
+                        + " ASC LIMIT 1";
+                break;
+            default:
+                throw new IllegalStateException("unreachable strategy " + rule.strategy);
+        }
+        return "CAST(COALESCE(" + ref + ", (" + agg + ")) AS "
+                + replaceOutputType(rule, column) + ")";
+    }
+
+    private SqlBuildResult buildReplaceNull(DagNode node, Dag dag, long flowId, Set<String> missing) {
+        DagNode up = dag.firstUpstream(node.id());
+        String upTable = up == null ? "<missing_upstream>" : tableOf(up, dag, flowId, missing);
+        if (up == null) {
+            missing.add(node.id() + ":no-upstream");
+        }
+        String alias = Identifiers.requireAlias(node.text("alias", "a"), "a");
+        Identifiers.QuoteStyle q = Identifiers.QuoteStyle.BACKTICK;
+        List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                : outputColumns(up, dag, flowId, missing, 0);
+        List<ReplaceRule> rules = parseReplaceRules(node);
+        validateReplaceRules(node, rules, upCols);
+
+        List<String> selects = new ArrayList<>();
+        for (OutputColumn column : upCols) {
+            ReplaceRule rule = findReplaceRule(rules, column.getName());
+            if (rule != null && rule.inPlace(column.getName())) {
+                selects.add(replaceExpression(rule, column, alias, upTable, q)
+                        + " AS " + Identifiers.quote(column.getName(), q));
+            } else {
+                selects.add(Identifiers.ref(alias, column.getName(), q));
+            }
+        }
+        for (ReplaceRule rule : rules) {
+            OutputColumn column = findColumn(upCols, rule.field);
+            if (rule.inPlace(column.getName())) {
+                continue;
+            }
+            selects.add(replaceExpression(rule, column, alias, upTable, q)
+                    + " AS " + Identifiers.quote(rule.output, q));
+        }
+
+        String sql = "SELECT\n  " + String.join(",\n  ", selects)
+                + "\nFROM " + upTable + " AS " + Identifiers.quote(alias, q);
+        SqlBuildResult r = new SqlBuildResult();
+        r.setSql(sql);
+        r.setDisplaySql(sql);
+        return r;
+    }
+
+    // ---------------------------------------------------------- sort rows
+
+    private static final class SortKey {
+        final String field;
+        final String direction;
+        final List<String> values;
+
+        SortKey(String field, String direction, List<String> values) {
+            this.field = field;
+            this.direction = direction;
+            this.values = values;
+        }
+    }
+
+    private static final Set<String> SORT_FUNCTIONS = new LinkedHashSet<>(
+            java.util.Arrays.asList("ROW_NUMBER", "RANK", "DENSE_RANK"));
+
+    private List<SortKey> parseSortKeys(JsonNode arr) {
+        List<SortKey> keys = new ArrayList<>();
+        if (arr == null) {
+            return keys;
+        }
+        for (JsonNode k : arr) {
+            List<String> values = new ArrayList<>();
+            JsonNode v = k.get("values");
+            if (v != null && v.isArray()) {
+                for (JsonNode item : v) {
+                    values.add(item.asText(""));
+                }
+            }
+            keys.add(new SortKey(
+                    k.path("field").asText("").trim(),
+                    k.path("direction").asText("").trim().toUpperCase(Locale.ROOT),
+                    values));
+        }
+        return keys;
+    }
+
+    private static List<String> fieldNameList(JsonNode arr) {
+        List<String> list = new ArrayList<>();
+        if (arr == null) {
+            return list;
+        }
+        for (JsonNode n : arr) {
+            String name = n.isObject() ? n.path("field").asText("") : n.asText("");
+            list.add(name.trim());
+        }
+        return list;
+    }
+
+    private void validateSortKeys(DagNode node, List<SortKey> keys, List<OutputColumn> upCols,
+                                  String label, boolean allowCustom) {
+        for (SortKey key : keys) {
+            if (key.field.isEmpty()) {
+                throw paramError(node, "SORT_FIELD_MISSING",
+                        label + "的排序字段不能为空");
+            }
+            OutputColumn column = findColumn(upCols, key.field);
+            if (column == null) {
+                throw paramError(node, "SORT_FIELD_UNKNOWN",
+                        label + "引用了不存在的字段：" + key.field);
+            }
+            if (!"ASC".equals(key.direction) && !"DESC".equals(key.direction)
+                    && !(allowCustom && "CUSTOM".equals(key.direction))) {
+                throw paramError(node, "SORT_DIRECTION_INVALID",
+                        label + "不支持的排序方向：" + key.direction);
+            }
+            if ("CUSTOM".equals(key.direction)) {
+                if (key.values.isEmpty()) {
+                    throw paramError(node, "SORT_VALUES_EMPTY",
+                            label + "的自定义排序值至少需要一个：" + key.field);
+                }
+                if (isNumericType(column.getDorisType())) {
+                    for (String value : key.values) {
+                        if (!isNumericLiteral(value)) {
+                            throw paramError(node, "SORT_VALUE_INVALID",
+                                    label + "的自定义排序值必须是数字：" + value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private void validateSortRows(DagNode node, List<OutputColumn> upCols,
+                                  boolean simpleEnabled, List<SortKey> keys,
+                                  boolean groupEnabled, List<String> partitionBy,
+                                  List<SortKey> groupOrder, String groupFunction,
+                                  String groupOutput, boolean sequenceEnabled,
+                                  String sequenceOutput, boolean emitSequence,
+                                  boolean emitGroup) {
+        if (upCols.isEmpty()) {
+            throw paramError(node, "SORT_UPSTREAM_UNKNOWN",
+                    "排序节点无法确定上游字段，请先配置上游节点并获取字段");
+        }
+        Set<String> outputs = new LinkedHashSet<>();
+        for (OutputColumn column : upCols) {
+            outputs.add(column.getName().toLowerCase(Locale.ROOT));
+        }
+        if (simpleEnabled) {
+            if (keys.isEmpty()) {
+                throw paramError(node, "SORT_KEYS_EMPTY",
+                        "简单排序至少需要一个排序字段");
+            }
+            validateSortKeys(node, keys, upCols, "简单排序", true);
+        }
+        if (groupEnabled) {
+            if (partitionBy.isEmpty()) {
+                throw paramError(node, "SORT_PARTITION_EMPTY",
+                        "组内排序至少需要一个分区字段");
+            }
+            for (String field : partitionBy) {
+                if (field.isEmpty()) {
+                    throw paramError(node, "SORT_PARTITION_EMPTY",
+                            "组内排序的分区字段不能为空");
+                }
+                if (findColumn(upCols, field) == null) {
+                    throw paramError(node, "SORT_FIELD_UNKNOWN",
+                            "组内排序引用了不存在的分区字段：" + field);
+                }
+            }
+            if (groupOrder.isEmpty()) {
+                throw paramError(node, "SORT_GROUP_ORDER_EMPTY",
+                        "组内排序至少需要一个排序字段");
+            }
+            validateSortKeys(node, groupOrder, upCols, "组内排序", false);
+            if (!SORT_FUNCTIONS.contains(groupFunction)) {
+                throw paramError(node, "SORT_FUNCTION_INVALID",
+                        groupFunction.isEmpty()
+                                ? "组内排序的窗口函数不能为空"
+                                : "组内排序不支持的窗口函数：" + groupFunction);
+            }
+            if (groupOutput.isEmpty()) {
+                throw paramError(node, "SORT_GROUP_OUTPUT_EMPTY",
+                        "组内排序的名次列名不能为空");
+            }
+            String out = requireOutputName(node, groupOutput, "SORT_OUTPUT_INVALID", "排序");
+            if (!outputs.add(out.toLowerCase(Locale.ROOT))) {
+                throw paramError(node, "SORT_OUTPUT_DUPLICATE",
+                        "排序输出字段重名：" + out);
+            }
+        }
+        if (emitSequence) {
+            if (sequenceOutput.isEmpty()) {
+                throw paramError(node, "SORT_SEQUENCE_OUTPUT_EMPTY",
+                        "启用顺序列时必须填写顺序列名");
+            }
+            String out = requireOutputName(node, sequenceOutput, "SORT_OUTPUT_INVALID", "排序");
+            if (!outputs.add(out.toLowerCase(Locale.ROOT))) {
+                throw paramError(node, "SORT_OUTPUT_DUPLICATE",
+                        "排序输出字段重名：" + out);
+            }
+        }
+    }
+
+    private List<String> finalSortOrder(String alias, List<OutputColumn> upCols,
+                                        boolean simpleEnabled, List<SortKey> keys,
+                                        boolean groupEnabled, List<String> partitionBy,
+                                        List<SortKey> groupOrder, Identifiers.QuoteStyle q) {
+        List<String> order = new ArrayList<>();
+        if (simpleEnabled && !keys.isEmpty()) {
+            for (SortKey key : keys) {
+                OutputColumn column = findColumn(upCols, key.field);
+                String ref = Identifiers.ref(alias, column.getName(), q);
+                if ("CUSTOM".equals(key.direction)) {
+                    List<String> literals = new ArrayList<>();
+                    boolean numeric = isNumericType(column.getDorisType());
+                    for (String value : key.values) {
+                        literals.add(numeric ? value.trim() : stringLiteral(value));
+                    }
+                    String fieldExpr = "FIELD(" + ref + ", " + String.join(", ", literals) + ")";
+                    order.add("(CASE WHEN " + ref + " IS NULL OR " + fieldExpr
+                            + " = 0 THEN 1 ELSE 0 END)");
+                    order.add(fieldExpr + " ASC");
+                } else {
+                    order.add(ref + " " + key.direction);
+                }
+            }
+            return order;
+        }
+        if (groupEnabled) {
+            for (String field : partitionBy) {
+                order.add(Identifiers.ref(alias, findColumn(upCols, field).getName(), q) + " ASC");
+            }
+            for (SortKey key : groupOrder) {
+                order.add(Identifiers.ref(alias, findColumn(upCols, key.field).getName(), q)
+                        + " " + key.direction);
+            }
+        }
+        return order;
+    }
+
+    private SqlBuildResult buildSortRows(DagNode node, Dag dag, long flowId, Set<String> missing) {
+        DagNode up = dag.firstUpstream(node.id());
+        String upTable = up == null ? "<missing_upstream>" : tableOf(up, dag, flowId, missing);
+        if (up == null) {
+            missing.add(node.id() + ":no-upstream");
+        }
+        String alias = Identifiers.requireAlias(node.text("alias", "a"), "a");
+        Identifiers.QuoteStyle q = Identifiers.QuoteStyle.BACKTICK;
+        List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                : outputColumns(up, dag, flowId, missing, 0);
+
+        boolean sequenceEnabled = node.boolValue("sequenceEnabled", false);
+        String sequenceOutput = node.text("sequenceOutput", "").trim();
+        boolean simpleEnabled = node.boolValue("simpleEnabled", false);
+        List<SortKey> keys = parseSortKeys(node.array("keys"));
+        boolean groupEnabled = node.boolValue("groupEnabled", false);
+        List<String> partitionBy = fieldNameList(node.array("partitionBy"));
+        List<SortKey> groupOrder = parseSortKeys(node.array("groupOrderBy"));
+        String groupFunction = node.text("groupFunction", "").trim().toUpperCase(Locale.ROOT);
+        String groupOutput = node.text("groupOutput", "").trim();
+
+        boolean hasFinalOrder = (simpleEnabled && !keys.isEmpty()) || groupEnabled;
+        boolean emitSequence = sequenceEnabled && hasFinalOrder;
+        boolean emitGroup = groupEnabled;
+        validateSortRows(node, upCols, simpleEnabled, keys, groupEnabled, partitionBy,
+                groupOrder, groupFunction, groupOutput, sequenceEnabled, sequenceOutput,
+                emitSequence, emitGroup);
+        List<String> order = finalSortOrder(alias, upCols, simpleEnabled, keys, groupEnabled,
+                partitionBy, groupOrder, q);
+
+        List<String> selects = new ArrayList<>();
+        for (OutputColumn column : upCols) {
+            selects.add(Identifiers.ref(alias, column.getName(), q));
+        }
+        if (emitSequence) {
+            selects.add("ROW_NUMBER() OVER (ORDER BY " + String.join(", ", order) + ") AS "
+                    + Identifiers.quote(sequenceOutput, q));
+        }
+        if (emitGroup) {
+            List<String> partitionRefs = new ArrayList<>();
+            for (String field : partitionBy) {
+                partitionRefs.add(Identifiers.ref(alias, findColumn(upCols, field).getName(), q));
+            }
+            List<String> groupRefs = new ArrayList<>();
+            for (SortKey key : groupOrder) {
+                groupRefs.add(Identifiers.ref(alias, findColumn(upCols, key.field).getName(), q)
+                        + " " + key.direction);
+            }
+            selects.add(groupFunction + "() OVER (PARTITION BY "
+                    + String.join(", ", partitionRefs) + " ORDER BY "
+                    + String.join(", ", groupRefs) + ") AS "
+                    + Identifiers.quote(groupOutput, q));
+        }
+
+        StringBuilder sql = new StringBuilder("SELECT\n  ")
+                .append(String.join(",\n  ", selects))
+                .append("\nFROM ").append(upTable).append(" AS ")
+                .append(Identifiers.quote(alias, q));
+        if (!order.isEmpty()) {
+            sql.append("\nORDER BY ").append(String.join(", ", order));
+        }
+        SqlBuildResult r = new SqlBuildResult();
+        r.setSql(sql.toString());
+        r.setDisplaySql(sql.toString());
+        return r;
+    }
+
+    // ------------------------------------------------------- split fields
+
+    private static final class SplitPart {
+        final Integer index;
+        final String output;
+
+        SplitPart(Integer index, String output) {
+            this.index = index;
+            this.output = output;
+        }
+    }
+
+    private List<SplitPart> parseSplitParts(DagNode node) {
+        List<SplitPart> parts = new ArrayList<>();
+        JsonNode arr = node.array("parts");
+        if (arr == null) {
+            return parts;
+        }
+        for (JsonNode p : arr) {
+            Integer index = intOrNull(p.get("index"));
+            parts.add(new SplitPart(index, p.path("output").asText("").trim()));
+        }
+        return parts;
+    }
+
+    private void validateSplitFields(DagNode node, List<OutputColumn> upCols,
+                                     OutputColumn sourceColumn, String delimiter,
+                                     List<SplitPart> parts) {
+        if (upCols.isEmpty()) {
+            throw paramError(node, "SPLIT_UPSTREAM_UNKNOWN",
+                    "拆分字段无法确定上游字段，请先配置上游节点并获取字段");
+        }
+        if (sourceColumn == null) {
+            throw paramError(node, "SPLIT_FIELD_UNKNOWN",
+                    "拆分字段引用了不存在的字段：" + node.text("field", "").trim());
+        }
+        if (delimiter == null || delimiter.isEmpty()) {
+            throw paramError(node, "SPLIT_DELIMITER_EMPTY", "拆分字段的分隔符不能为空");
+        }
+        if (parts.isEmpty()) {
+            throw paramError(node, "SPLIT_PARTS_EMPTY", "拆分字段至少需要配置一个输出片段");
+        }
+        Set<String> outputs = new LinkedHashSet<>();
+        for (OutputColumn column : upCols) {
+            outputs.add(column.getName().toLowerCase(Locale.ROOT));
+        }
+        Set<Integer> indexes = new LinkedHashSet<>();
+        for (SplitPart part : parts) {
+            if (part.index == null || part.index < 1) {
+                throw paramError(node, "SPLIT_INDEX_INVALID",
+                        "拆分片段的序号必须从 1 开始：" + part.index);
+            }
+            if (!indexes.add(part.index)) {
+                throw paramError(node, "SPLIT_INDEX_DUPLICATE",
+                        "拆分片段的序号不能重复：" + part.index);
+            }
+            if (part.output.isEmpty()) {
+                throw paramError(node, "SPLIT_OUTPUT_EMPTY", "拆分片段的输出字段名不能为空");
+            }
+            String out = requireOutputName(node, part.output, "SPLIT_OUTPUT_INVALID", "拆分字段");
+            if (!outputs.add(out.toLowerCase(Locale.ROOT))) {
+                throw paramError(node, "SPLIT_OUTPUT_DUPLICATE",
+                        "拆分字段输出字段重名：" + out);
+            }
+        }
+    }
+
+    private static String splitPartExpression(String ref, String delimiter, SplitPart part,
+                                              boolean trim, boolean emptyAsNull) {
+        String delimiterLiteral = stringLiteral(delimiter);
+        String base;
+        if (part.index == 1) {
+            // SPLIT_PART 在值不含分隔符时返回 NULL；第 1 段按 Hop 语义回退为原值
+            base = "(CASE WHEN LOCATE(" + delimiterLiteral + ", " + ref + ") = 0 THEN " + ref
+                    + " ELSE SPLIT_PART(" + ref + ", " + delimiterLiteral + ", 1) END)";
+        } else {
+            base = "SPLIT_PART(" + ref + ", " + delimiterLiteral + ", " + part.index + ")";
+        }
+        if (trim) {
+            base = "TRIM(" + base + ")";
+        }
+        if (emptyAsNull) {
+            return "NULLIF(" + base + ", '')";
+        }
+        return "CASE WHEN " + ref + " IS NULL THEN NULL ELSE IFNULL(" + base + ", '') END";
+    }
+
+    private SqlBuildResult buildSplitFields(DagNode node, Dag dag, long flowId,
+                                            Set<String> missing) {
+        DagNode up = dag.firstUpstream(node.id());
+        String upTable = up == null ? "<missing_upstream>" : tableOf(up, dag, flowId, missing);
+        if (up == null) {
+            missing.add(node.id() + ":no-upstream");
+        }
+        String alias = Identifiers.requireAlias(node.text("alias", "a"), "a");
+        Identifiers.QuoteStyle q = Identifiers.QuoteStyle.BACKTICK;
+        List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                : outputColumns(up, dag, flowId, missing, 0);
+        String field = node.text("field", "").trim();
+        OutputColumn sourceColumn = findColumn(upCols, field);
+        String delimiter = node.text("delimiter", null);
+        List<SplitPart> parts = parseSplitParts(node);
+        validateSplitFields(node, upCols, sourceColumn, delimiter, parts);
+
+        boolean keepOriginal = node.boolValue("keepOriginal", true);
+        boolean trim = node.boolValue("trim", true);
+        boolean emptyAsNull = node.boolValue("emptyAsNull", true);
+        String ref = Identifiers.ref(alias, sourceColumn.getName(), q);
+
+        List<String> selects = new ArrayList<>();
+        for (OutputColumn column : upCols) {
+            if (column.getName().equals(sourceColumn.getName()) && !keepOriginal) {
+                continue;
+            }
+            selects.add(Identifiers.ref(alias, column.getName(), q));
+        }
+        for (SplitPart part : parts) {
+            selects.add(splitPartExpression(ref, delimiter, part, trim, emptyAsNull)
+                    + " AS " + Identifiers.quote(part.output, q));
+        }
+
+        String sql = "SELECT\n  " + String.join(",\n  ", selects)
+                + "\nFROM " + upTable + " AS " + Identifiers.quote(alias, q);
+        SqlBuildResult r = new SqlBuildResult();
+        r.setSql(sql);
+        r.setDisplaySql(sql);
+        return r;
+    }
+
+    // -------------------------------------------------- split fields to rows
+
+    private static String uniqueAlias(List<OutputColumn> upCols, String base, Set<String> taken) {
+        String name = base;
+        int suffix = 2;
+        while (containsColumn(upCols, name) || taken.contains(name.toLowerCase(Locale.ROOT))) {
+            name = base + "_" + suffix++;
+        }
+        taken.add(name.toLowerCase(Locale.ROOT));
+        return name;
+    }
+
+    private static boolean containsColumn(List<OutputColumn> upCols, String name) {
+        for (OutputColumn column : upCols) {
+            if (column.getName().equalsIgnoreCase(name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void validateSplitRows(DagNode node, List<OutputColumn> upCols,
+                                   OutputColumn sourceColumn, String delimiter, String output,
+                                   boolean keepOriginal, String positionOutput) {
+        if (upCols.isEmpty()) {
+            throw paramError(node, "SPLIT_UPSTREAM_UNKNOWN",
+                    "拆分字段为多行无法确定上游字段，请先配置上游节点并获取字段");
+        }
+        if (sourceColumn == null) {
+            throw paramError(node, "SPLIT_FIELD_UNKNOWN",
+                    "拆分字段为多行引用了不存在的字段：" + node.text("field", "").trim());
+        }
+        if (delimiter == null || delimiter.isEmpty()) {
+            throw paramError(node, "SPLIT_DELIMITER_EMPTY", "拆分字段的分隔符不能为空");
+        }
+        if (output.isEmpty()) {
+            throw paramError(node, "SPLIT_OUTPUT_EMPTY", "拆分字段为多行的输出字段名不能为空");
+        }
+        String out = requireOutputName(node, output, "SPLIT_OUTPUT_INVALID", "拆分字段为多行");
+        boolean inPlace = out.equals(sourceColumn.getName());
+        Set<String> outputs = new LinkedHashSet<>();
+        for (OutputColumn column : upCols) {
+            if (inPlace) {
+                continue;
+            }
+            if (column.getName().equals(sourceColumn.getName()) && !keepOriginal) {
+                continue;
+            }
+            outputs.add(column.getName().toLowerCase(Locale.ROOT));
+        }
+        if (!inPlace && !outputs.add(out.toLowerCase(Locale.ROOT))) {
+            throw paramError(node, "SPLIT_OUTPUT_DUPLICATE",
+                    "拆分字段为多行输出字段重名：" + out);
+        }
+        if (inPlace) {
+            outputs.add(out.toLowerCase(Locale.ROOT));
+        }
+        if (positionOutput != null && !positionOutput.isEmpty()) {
+            String pos = requireOutputName(node, positionOutput, "SPLIT_OUTPUT_INVALID",
+                    "拆分字段为多行序号列");
+            if (!outputs.add(pos.toLowerCase(Locale.ROOT))) {
+                throw paramError(node, "SPLIT_OUTPUT_DUPLICATE",
+                        "拆分字段为多行序号列重名：" + pos);
+            }
+        }
+    }
+
+    private SqlBuildResult buildSplitFieldsToRows(DagNode node, Dag dag, long flowId,
+                                                  Set<String> missing) {
+        DagNode up = dag.firstUpstream(node.id());
+        String upTable = up == null ? "<missing_upstream>" : tableOf(up, dag, flowId, missing);
+        if (up == null) {
+            missing.add(node.id() + ":no-upstream");
+        }
+        String alias = Identifiers.requireAlias(node.text("alias", "a"), "a");
+        Identifiers.QuoteStyle q = Identifiers.QuoteStyle.BACKTICK;
+        List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                : outputColumns(up, dag, flowId, missing, 0);
+        String field = node.text("field", "").trim();
+        OutputColumn sourceColumn = findColumn(upCols, field);
+        String delimiter = node.text("delimiter", null);
+        String output = node.text("output", "").trim();
+        boolean keepOriginal = node.boolValue("keepOriginal", true);
+        boolean trim = node.boolValue("trim", true);
+        boolean dropEmpty = node.boolValue("dropEmpty", false);
+        String positionOutput = node.text("positionOutput", "").trim();
+        validateSplitRows(node, upCols, sourceColumn, delimiter, output, keepOriginal,
+                positionOutput);
+
+        boolean inPlace = output.equals(sourceColumn.getName());
+        Set<String> taken = new LinkedHashSet<>();
+        String lvAlias = uniqueAlias(upCols, "__dm_lv", taken);
+        String posAlias = uniqueAlias(upCols, "__dm_pos", taken);
+        String valAlias = uniqueAlias(upCols, "__dm_val", taken);
+
+        String ref = Identifiers.ref(alias, sourceColumn.getName(), q);
+        String arrayExpr = "IF(" + ref + " IS NULL OR " + ref + " = '', ARRAY(NULL), "
+                + "SPLIT_BY_STRING(" + ref + ", " + stringLiteral(delimiter) + "))";
+        String valueExpr = trim
+                ? "TRIM(" + Identifiers.quote(valAlias, q) + ")"
+                : Identifiers.quote(valAlias, q);
+
+        List<String> selects = new ArrayList<>();
+        for (OutputColumn column : upCols) {
+            if (column.getName().equals(sourceColumn.getName())) {
+                if (inPlace) {
+                    selects.add(valueExpr + " AS " + Identifiers.quote(output, q));
+                } else if (keepOriginal) {
+                    selects.add(Identifiers.ref(alias, column.getName(), q));
+                }
+                continue;
+            }
+            selects.add(Identifiers.ref(alias, column.getName(), q));
+        }
+        if (!inPlace) {
+            selects.add(valueExpr + " AS " + Identifiers.quote(output, q));
+        }
+        if (!positionOutput.isEmpty()) {
+            selects.add("(" + Identifiers.quote(posAlias, q) + " + 1) AS "
+                    + Identifiers.quote(positionOutput, q));
+        }
+
+        StringBuilder sql = new StringBuilder("SELECT\n  ")
+                .append(String.join(",\n  ", selects))
+                .append("\nFROM ").append(upTable).append(" AS ")
+                .append(Identifiers.quote(alias, q))
+                .append("\nLATERAL VIEW posexplode(").append(arrayExpr).append(") ")
+                .append(Identifiers.quote(lvAlias, q)).append(" AS ")
+                .append(Identifiers.quote(posAlias, q)).append(", ")
+                .append(Identifiers.quote(valAlias, q));
+        if (dropEmpty) {
+            sql.append("\nWHERE ").append(valueExpr).append(" IS NOT NULL AND ")
+                    .append(valueExpr).append(" <> ''");
+        }
+        SqlBuildResult r = new SqlBuildResult();
+        r.setSql(sql.toString());
+        r.setDisplaySql(sql.toString());
+        return r;
+    }
+
+    private static String requireOutputName(DagNode node, String raw, String reason, String label) {
+        try {
+            return Identifiers.requireField(raw);
+        } catch (BizException e) {
+            throw paramError(node, reason, label + "输出字段名不合法：" + raw);
+        }
+    }
+
+    private static BizException paramError(DagNode node, String reason, String message) {
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("nodeId", node.id());
+        data.put("reason", reason);
+        return new BizException(ErrorCode.PARAM_ERROR, message, data);
+    }
+
     // ------------------------------------------------------- output columns
 
     private List<OutputColumn> outputColumns(DagNode node, Dag dag, long flowId,
@@ -728,6 +1516,112 @@ public class SqlBuilderFactory {
                 List<OutputColumn> result = new ArrayList<>(upCols);
                 for (FormulaRow row : rows) {
                     result.add(new OutputColumn(row.output, formulaType(node, row)));
+                }
+                return result;
+            }
+            case "replace_null": {
+                DagNode up = dag.firstUpstream(node.id());
+                List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                        : outputColumns(up, dag, flowId, missing, depth + 1);
+                List<ReplaceRule> rules = parseReplaceRules(node);
+                validateReplaceRules(node, rules, upCols);
+                List<OutputColumn> result = new ArrayList<>();
+                for (OutputColumn column : upCols) {
+                    ReplaceRule rule = findReplaceRule(rules, column.getName());
+                    String type = rule != null && rule.inPlace(column.getName())
+                            ? replaceOutputType(rule, column) : column.getDorisType();
+                    result.add(new OutputColumn(column.getName(), type));
+                }
+                for (ReplaceRule rule : rules) {
+                    OutputColumn column = findColumn(upCols, rule.field);
+                    if (rule.inPlace(column.getName())) {
+                        continue;
+                    }
+                    result.add(new OutputColumn(rule.output, replaceOutputType(rule, column)));
+                }
+                return result;
+            }
+            case "sort_rows": {
+                DagNode up = dag.firstUpstream(node.id());
+                List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                        : outputColumns(up, dag, flowId, missing, depth + 1);
+                boolean sequenceEnabled = node.boolValue("sequenceEnabled", false);
+                String sequenceOutput = node.text("sequenceOutput", "").trim();
+                boolean simpleEnabled = node.boolValue("simpleEnabled", false);
+                List<SortKey> keys = parseSortKeys(node.array("keys"));
+                boolean groupEnabled = node.boolValue("groupEnabled", false);
+                List<String> partitionBy = fieldNameList(node.array("partitionBy"));
+                List<SortKey> groupOrder = parseSortKeys(node.array("groupOrderBy"));
+                String groupFunction = node.text("groupFunction", "")
+                        .trim().toUpperCase(Locale.ROOT);
+                String groupOutput = node.text("groupOutput", "").trim();
+                boolean hasFinalOrder = (simpleEnabled && !keys.isEmpty()) || groupEnabled;
+                boolean emitSequence = sequenceEnabled && hasFinalOrder;
+                boolean emitGroup = groupEnabled;
+                validateSortRows(node, upCols, simpleEnabled, keys, groupEnabled, partitionBy,
+                        groupOrder, groupFunction, groupOutput, sequenceEnabled, sequenceOutput,
+                        emitSequence, emitGroup);
+                List<OutputColumn> result = new ArrayList<>(upCols);
+                if (emitSequence) {
+                    result.add(new OutputColumn(sequenceOutput, "BIGINT"));
+                }
+                if (emitGroup) {
+                    result.add(new OutputColumn(groupOutput, "BIGINT"));
+                }
+                return result;
+            }
+            case "split_fields": {
+                DagNode up = dag.firstUpstream(node.id());
+                List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                        : outputColumns(up, dag, flowId, missing, depth + 1);
+                String field = node.text("field", "").trim();
+                OutputColumn sourceColumn = findColumn(upCols, field);
+                String delimiter = node.text("delimiter", null);
+                List<SplitPart> parts = parseSplitParts(node);
+                validateSplitFields(node, upCols, sourceColumn, delimiter, parts);
+                boolean keepOriginal = node.boolValue("keepOriginal", true);
+                List<OutputColumn> result = new ArrayList<>();
+                for (OutputColumn column : upCols) {
+                    if (column.getName().equals(sourceColumn.getName()) && !keepOriginal) {
+                        continue;
+                    }
+                    result.add(new OutputColumn(column.getName(), column.getDorisType()));
+                }
+                for (SplitPart part : parts) {
+                    result.add(new OutputColumn(part.output, "STRING"));
+                }
+                return result;
+            }
+            case "split_fields_to_rows": {
+                DagNode up = dag.firstUpstream(node.id());
+                List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                        : outputColumns(up, dag, flowId, missing, depth + 1);
+                String field = node.text("field", "").trim();
+                OutputColumn sourceColumn = findColumn(upCols, field);
+                String delimiter = node.text("delimiter", null);
+                String output = node.text("output", "").trim();
+                boolean keepOriginal = node.boolValue("keepOriginal", true);
+                String positionOutput = node.text("positionOutput", "").trim();
+                validateSplitRows(node, upCols, sourceColumn, delimiter, output,
+                        keepOriginal, positionOutput);
+                boolean inPlace = output.equals(sourceColumn.getName());
+                List<OutputColumn> result = new ArrayList<>();
+                for (OutputColumn column : upCols) {
+                    if (column.getName().equals(sourceColumn.getName())) {
+                        if (inPlace) {
+                            result.add(new OutputColumn(output, "STRING"));
+                        } else if (keepOriginal) {
+                            result.add(new OutputColumn(column.getName(), column.getDorisType()));
+                        }
+                        continue;
+                    }
+                    result.add(new OutputColumn(column.getName(), column.getDorisType()));
+                }
+                if (!inPlace) {
+                    result.add(new OutputColumn(output, "STRING"));
+                }
+                if (!positionOutput.isEmpty()) {
+                    result.add(new OutputColumn(positionOutput, "BIGINT"));
                 }
                 return result;
             }

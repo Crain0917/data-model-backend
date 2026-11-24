@@ -730,6 +730,369 @@ class SqlBuilderFactoryTest {
         assertEquals("FORMULA_OUTPUT_INVALID", reason(type));
     }
 
+    // ----------------------------------------------------- ReplaceNull
+
+    private static final String OPS_FIELDS = field("uid", "BIGINT") + ","
+            + field("amount", "DECIMAL") + "," + field("city", "VARCHAR") + ","
+            + field("note", "VARCHAR") + "," + field("tags", "VARCHAR") + ","
+            + field("path", "STRING");
+
+    private JsonNode opsDag(String nodeType, String nodeId, String configJson) throws Exception {
+        String nodes = source("s1", 1, "ops", OPS_FIELDS) + ","
+                + "{\"id\":\"" + nodeId + "\",\"type\":\"" + nodeType
+                + "\",\"data\":{\"config\":" + configJson + "}}";
+        return dag(nodesEdges(nodes, edge("e1", "s1", nodeId, "in-0")));
+    }
+
+    @Test
+    void replaceNullBuildsStrategiesAndOutputColumns() throws Exception {
+        SqlBuildResult result = factory.build(opsDag("replace_null", "r1", "{"
+                + "\"alias\":\"a\",\"rules\":["
+                + "{\"field\":\"amount\",\"strategy\":\"MAX\"},"
+                + "{\"field\":\"city\",\"strategy\":\"VALUE\",\"value\":\"unknown\","
+                + "\"output\":\"city_filled\"},"
+                + "{\"field\":\"note\",\"strategy\":\"VALUE\",\"value\":\"\","
+                + "\"treatEmptyAsNull\":true},"
+                + "{\"field\":\"uid\",\"strategy\":\"AVG\"}"
+                + "]}"), 101L, "r1");
+        String sql = result.getSql();
+
+        assertTrue(sql.contains("CAST(COALESCE(`a`.`amount`, (SELECT MAX(`amount`) FROM"), sql);
+        assertTrue(sql.contains("AS `dm_agg`)) AS DECIMAL)"), sql);
+        assertTrue(sql.contains("COALESCE(`a`.`city`, 'unknown') AS `city_filled`"), sql);
+        assertTrue(sql.contains("COALESCE(NULLIF(`a`.`note`, ''), '') AS `note`"), sql);
+        assertTrue(sql.contains("CAST(COALESCE(`a`.`uid`, (SELECT AVG(`uid`) FROM"), sql);
+        assertTrue(sql.contains("AS `dm_agg`)) AS DOUBLE) AS `uid`"), sql);
+
+        assertEquals(7, result.getOutputColumns().size());
+        assertEquals("amount", result.getOutputColumns().get(1).getName());
+        assertEquals("DECIMAL", result.getOutputColumns().get(1).getDorisType());
+        assertEquals("uid", result.getOutputColumns().get(0).getName());
+        assertEquals("DOUBLE", result.getOutputColumns().get(0).getDorisType());
+        assertEquals("city_filled", result.getOutputColumns().get(6).getName());
+        assertEquals("VARCHAR", result.getOutputColumns().get(6).getDorisType());
+    }
+
+    @Test
+    void replaceNullSupportsMedianAndMode() throws Exception {
+        SqlBuildResult result = factory.build(opsDag("replace_null", "r1", "{"
+                + "\"alias\":\"a\",\"rules\":["
+                + "{\"field\":\"amount\",\"strategy\":\"MEDIAN\"},"
+                + "{\"field\":\"uid\",\"strategy\":\"MODE\"}"
+                + "]}"), 101L, "r1");
+        String sql = result.getSql();
+        assertTrue(sql.contains("PERCENTILE(`amount`, 0.5)"), sql);
+        assertTrue(sql.contains("ORDER BY COUNT(*) DESC, `uid` ASC LIMIT 1"), sql);
+        assertEquals("DOUBLE", result.getOutputColumns().get(1).getDorisType());
+        assertEquals("BIGINT", result.getOutputColumns().get(0).getDorisType());
+    }
+
+    @Test
+    void replaceNullRejectsInvalidConfigurations() throws Exception {
+        String[][] cases = {
+                {"{\"alias\":\"a\",\"rules\":[]}", "REPLACE_RULES_EMPTY"},
+                {"{\"alias\":\"a\",\"rules\":[{\"field\":\"city\",\"strategy\":\"MAX\"}]}",
+                        "REPLACE_STRATEGY_UNSUPPORTED"},
+                {"{\"alias\":\"a\",\"rules\":[{\"field\":\"nope\",\"strategy\":\"VALUE\","
+                        + "\"value\":\"1\"}]}", "REPLACE_FIELD_UNKNOWN"},
+                {"{\"alias\":\"a\",\"rules\":[{\"field\":\"amount\",\"strategy\":\"VALUE\","
+                        + "\"value\":\"abc\"}]}", "REPLACE_VALUE_INVALID"},
+                {"{\"alias\":\"a\",\"rules\":[{\"field\":\"amount\",\"strategy\":\"VALUE\"}]}",
+                        "REPLACE_VALUE_MISSING"},
+                {"{\"alias\":\"a\",\"rules\":[{\"field\":\"amount\",\"strategy\":\"MAX\"},"
+                        + "{\"field\":\"amount\",\"strategy\":\"MIN\"}]}",
+                        "REPLACE_RULE_DUPLICATE"},
+                {"{\"alias\":\"a\",\"rules\":[{\"field\":\"amount\",\"strategy\":\"VALUE\","
+                        + "\"value\":\"1\",\"output\":\"city\"}]}", "REPLACE_OUTPUT_DUPLICATE"},
+                {"{\"alias\":\"a\",\"rules\":[{\"field\":\"city\",\"strategy\":\"SUM\"}]}",
+                        "REPLACE_STRATEGY_INVALID"},
+        };
+        for (String[] c : cases) {
+            BizException e = assertThrows(BizException.class,
+                    () -> factory.build(opsDag("replace_null", "r1", c[0]), 101L, "r1"), c[0]);
+            assertEquals(4000, e.getErrorCode().getCode(), c[0]);
+            assertEquals(c[1], reason(e), c[0] + " -> " + e.getMessage());
+        }
+    }
+
+    // -------------------------------------------------------- SortRows
+
+    @Test
+    void sortRowsBuildsSequenceSimpleAndGroupWindow() throws Exception {
+        SqlBuildResult result = factory.build(opsDag("sort_rows", "o1", "{"
+                + "\"alias\":\"a\",\"sequenceEnabled\":true,\"sequenceOutput\":\"seq_no\","
+                + "\"simpleEnabled\":true,\"keys\":["
+                + "{\"field\":\"city\",\"direction\":\"ASC\"},"
+                + "{\"field\":\"amount\",\"direction\":\"CUSTOM\",\"values\":[\"10\",\"20\"]}],"
+                + "\"groupEnabled\":true,\"partitionBy\":[\"uid\"],"
+                + "\"groupOrderBy\":[{\"field\":\"amount\",\"direction\":\"DESC\"}],"
+                + "\"groupFunction\":\"RANK\",\"groupOutput\":\"rn\"}"), 101L, "o1");
+        String sql = result.getSql();
+
+        String customOrder = "(CASE WHEN `a`.`amount` IS NULL OR "
+                + "FIELD(`a`.`amount`, 10, 20) = 0 THEN 1 ELSE 0 END)";
+        assertTrue(sql.contains("ROW_NUMBER() OVER (ORDER BY `a`.`city` ASC, "
+                + customOrder + ", FIELD(`a`.`amount`, 10, 20) ASC) "
+                + "AS `seq_no`"), sql);
+        assertTrue(sql.contains("RANK() OVER (PARTITION BY `a`.`uid` ORDER BY "
+                + "`a`.`amount` DESC) AS `rn`"), sql);
+        assertTrue(sql.contains("ORDER BY `a`.`city` ASC, "
+                + customOrder + ", FIELD(`a`.`amount`, 10, 20) ASC"), sql);
+        assertEquals(8, result.getOutputColumns().size());
+        assertEquals("seq_no", result.getOutputColumns().get(6).getName());
+        assertEquals("BIGINT", result.getOutputColumns().get(6).getDorisType());
+        assertEquals("rn", result.getOutputColumns().get(7).getName());
+        assertEquals("BIGINT", result.getOutputColumns().get(7).getDorisType());
+    }
+
+    @Test
+    void sortRowsGroupOnlyOrdersByPartitionAndGroupKeys() throws Exception {
+        SqlBuildResult result = factory.build(opsDag("sort_rows", "o1", "{"
+                + "\"alias\":\"a\",\"sequenceEnabled\":true,\"sequenceOutput\":\"seq_no\","
+                + "\"groupEnabled\":true,\"partitionBy\":[\"uid\"],"
+                + "\"groupOrderBy\":[{\"field\":\"city\",\"direction\":\"ASC\"}],"
+                + "\"groupFunction\":\"DENSE_RANK\",\"groupOutput\":\"dr\"}"), 101L, "o1");
+        String sql = result.getSql();
+        assertTrue(sql.contains("DENSE_RANK() OVER (PARTITION BY `a`.`uid` ORDER BY "
+                + "`a`.`city` ASC) AS `dr`"), sql);
+        assertTrue(sql.contains("ROW_NUMBER() OVER (ORDER BY `a`.`uid` ASC, "
+                + "`a`.`city` ASC) AS `seq_no`"), sql);
+        assertTrue(sql.endsWith("ORDER BY `a`.`uid` ASC, `a`.`city` ASC"), sql);
+    }
+
+    @Test
+    void sortRowsAllOffIsPassthrough() throws Exception {
+        SqlBuildResult result = factory.build(opsDag("sort_rows", "o1", "{"
+                + "\"alias\":\"a\",\"sequenceEnabled\":true,\"sequenceOutput\":\"seq_no\","
+                + "\"simpleEnabled\":false,\"groupEnabled\":false}"), 101L, "o1");
+        String sql = result.getSql();
+        assertTrue(!sql.contains("OVER ("), sql);
+        assertTrue(!sql.contains("ORDER BY"), sql);
+        assertTrue(!sql.contains("`seq_no`"), sql);
+        assertEquals(6, result.getOutputColumns().size());
+    }
+
+    @Test
+    void sortRowsCustomStringValuesAreEscaped() throws Exception {
+        SqlBuildResult result = factory.build(opsDag("sort_rows", "o1", "{"
+                + "\"alias\":\"a\",\"simpleEnabled\":true,\"keys\":["
+                + "{\"field\":\"city\",\"direction\":\"CUSTOM\",\"values\":[\"O'Hare\",\"B\"]}]}"),
+                101L, "o1");
+        assertTrue(result.getSql().contains(
+                "FIELD(`a`.`city`, 'O''Hare', 'B')"), result.getSql());
+    }
+
+    @Test
+    void sortRowsCustomSortPutsNullWithUnlistedValuesLast() throws Exception {
+        SqlBuildResult result = factory.build(opsDag("sort_rows", "o1", "{"
+                + "\"alias\":\"a\",\"simpleEnabled\":true,\"keys\":["
+                + "{\"field\":\"city\",\"direction\":\"CUSTOM\",\"values\":[\"NEW\",\"PAID\"]}]}"),
+                101L, "o1");
+        String sql = result.getSql();
+        assertTrue(sql.contains("ORDER BY (CASE WHEN `a`.`city` IS NULL OR "
+                + "FIELD(`a`.`city`, 'NEW', 'PAID') = 0 THEN 1 ELSE 0 END), "
+                + "FIELD(`a`.`city`, 'NEW', 'PAID') ASC"), sql);
+        assertTrue(!sql.contains("(FIELD(`a`.`city`, 'NEW', 'PAID') = 0)"), sql);
+    }
+
+    @Test
+    void sortRowsCustomNumericSortAlsoGuardsNull() throws Exception {
+        SqlBuildResult result = factory.build(opsDag("sort_rows", "o1", "{"
+                + "\"alias\":\"a\",\"sequenceEnabled\":true,\"sequenceOutput\":\"seq\","
+                + "\"simpleEnabled\":true,\"keys\":["
+                + "{\"field\":\"amount\",\"direction\":\"CUSTOM\",\"values\":[\"10\",\"20\"]}]}"),
+                101L, "o1");
+        assertTrue(result.getSql().contains("ROW_NUMBER() OVER (ORDER BY (CASE WHEN "
+                + "`a`.`amount` IS NULL OR FIELD(`a`.`amount`, 10, 20) = 0 THEN 1 ELSE 0 END), "
+                + "FIELD(`a`.`amount`, 10, 20) ASC) AS `seq`"), result.getSql());
+    }
+
+    @Test
+    void sortRowsRejectsInvalidConfigurations() throws Exception {
+        String[][] cases = {
+                {"{\"alias\":\"a\",\"simpleEnabled\":true,\"keys\":[]}", "SORT_KEYS_EMPTY"},
+                {"{\"alias\":\"a\",\"simpleEnabled\":true,\"keys\":[{\"field\":\"nope\","
+                        + "\"direction\":\"ASC\"}]}", "SORT_FIELD_UNKNOWN"},
+                {"{\"alias\":\"a\",\"simpleEnabled\":true,\"keys\":[{\"field\":\"city\","
+                        + "\"direction\":\"UP\"}]}", "SORT_DIRECTION_INVALID"},
+                {"{\"alias\":\"a\",\"simpleEnabled\":true,\"keys\":[{\"field\":\"city\","
+                        + "\"direction\":\"CUSTOM\",\"values\":[]}]}", "SORT_VALUES_EMPTY"},
+                {"{\"alias\":\"a\",\"simpleEnabled\":true,\"keys\":[{\"field\":\"amount\","
+                        + "\"direction\":\"CUSTOM\",\"values\":[\"x\"]}]}", "SORT_VALUE_INVALID"},
+                {"{\"alias\":\"a\",\"groupEnabled\":true,\"partitionBy\":[],"
+                        + "\"groupOrderBy\":[{\"field\":\"city\",\"direction\":\"ASC\"}],"
+                        + "\"groupFunction\":\"RANK\",\"groupOutput\":\"rn\"}",
+                        "SORT_PARTITION_EMPTY"},
+                {"{\"alias\":\"a\",\"groupEnabled\":true,\"partitionBy\":[\"uid\"],"
+                        + "\"groupOrderBy\":[],\"groupFunction\":\"RANK\",\"groupOutput\":\"rn\"}",
+                        "SORT_GROUP_ORDER_EMPTY"},
+                {"{\"alias\":\"a\",\"groupEnabled\":true,\"partitionBy\":[\"uid\"],"
+                        + "\"groupOrderBy\":[{\"field\":\"city\",\"direction\":\"ASC\"}],"
+                        + "\"groupFunction\":\"NTILE\",\"groupOutput\":\"rn\"}",
+                        "SORT_FUNCTION_INVALID"},
+                {"{\"alias\":\"a\",\"groupEnabled\":true,\"partitionBy\":[\"uid\"],"
+                        + "\"groupOrderBy\":[{\"field\":\"city\",\"direction\":\"ASC\"}],"
+                        + "\"groupFunction\":\"RANK\",\"groupOutput\":\"uid\"}",
+                        "SORT_OUTPUT_DUPLICATE"},
+                {"{\"alias\":\"a\",\"sequenceEnabled\":true,\"sequenceOutput\":\"uid\","
+                        + "\"simpleEnabled\":true,\"keys\":[{\"field\":\"city\","
+                        + "\"direction\":\"ASC\"}]}", "SORT_OUTPUT_DUPLICATE"},
+        };
+        for (String[] c : cases) {
+            BizException e = assertThrows(BizException.class,
+                    () -> factory.build(opsDag("sort_rows", "o1", c[0]), 101L, "o1"), c[0]);
+            assertEquals(4000, e.getErrorCode().getCode(), c[0]);
+            assertEquals(c[1], reason(e), c[0] + " -> " + e.getMessage());
+        }
+    }
+
+    // ----------------------------------------------------- SplitFields
+
+    @Test
+    void splitFieldsBuildsPartsAndOutputColumns() throws Exception {
+        SqlBuildResult result = factory.build(opsDag("split_fields", "p1", "{"
+                + "\"alias\":\"a\",\"field\":\"path\",\"delimiter\":\"/\","
+                + "\"keepOriginal\":true,\"trim\":true,\"emptyAsNull\":true,"
+                + "\"parts\":[{\"index\":1,\"output\":\"p1\"},{\"index\":2,\"output\":\"p2\"}]}"),
+                101L, "p1");
+        String sql = result.getSql();
+        assertTrue(sql.contains("NULLIF(TRIM((CASE WHEN LOCATE('/', `a`.`path`) = 0 THEN "
+                + "`a`.`path` ELSE SPLIT_PART(`a`.`path`, '/', 1) END)), '') AS `p1`"), sql);
+        assertTrue(sql.contains("NULLIF(TRIM(SPLIT_PART(`a`.`path`, '/', 2)), '') AS `p2`"), sql);
+        assertEquals(8, result.getOutputColumns().size());
+        assertEquals("p1", result.getOutputColumns().get(6).getName());
+        assertEquals("STRING", result.getOutputColumns().get(6).getDorisType());
+        assertEquals("path", result.getOutputColumns().get(5).getName());
+    }
+
+    @Test
+    void splitFieldsCanRemoveOriginalAndKeepEmptyStrings() throws Exception {
+        SqlBuildResult result = factory.build(opsDag("split_fields", "p1", "{"
+                + "\"alias\":\"a\",\"field\":\"path\",\"delimiter\":\"||\","
+                + "\"keepOriginal\":false,\"trim\":false,\"emptyAsNull\":false,"
+                + "\"parts\":[{\"index\":1,\"output\":\"head\"}]}"), 101L, "p1");
+        String sql = result.getSql();
+        assertTrue(sql.startsWith("SELECT\n  `a`.`uid`,"), sql);
+        assertTrue(sql.contains("CASE WHEN `a`.`path` IS NULL THEN NULL ELSE "
+                + "IFNULL((CASE WHEN LOCATE('||', `a`.`path`) = 0 THEN `a`.`path` "
+                + "ELSE SPLIT_PART(`a`.`path`, '||', 1) END), '') END AS `head`"), sql);
+        assertEquals(6, result.getOutputColumns().size());
+        assertTrue(result.getOutputColumns().stream()
+                .noneMatch(c -> c.getName().equals("path")));
+    }
+
+    @Test
+    void splitFieldsFirstPartFallsBackToOriginalWithoutDelimiter() throws Exception {
+        SqlBuildResult result = factory.build(opsDag("split_fields", "p1", "{"
+                + "\"alias\":\"a\",\"field\":\"path\",\"delimiter\":\"/\","
+                + "\"keepOriginal\":true,\"trim\":false,\"emptyAsNull\":true,"
+                + "\"parts\":[{\"index\":1,\"output\":\"p1\"},"
+                + "{\"index\":2,\"output\":\"p2\"}]}"), 101L, "p1");
+        String sql = result.getSql();
+        assertTrue(sql.contains("NULLIF((CASE WHEN LOCATE('/', `a`.`path`) = 0 THEN "
+                + "`a`.`path` ELSE SPLIT_PART(`a`.`path`, '/', 1) END), '') AS `p1`"), sql);
+        assertTrue(sql.contains("NULLIF(SPLIT_PART(`a`.`path`, '/', 2), '') AS `p2`"), sql);
+        assertEquals(sql.indexOf("LOCATE("), sql.lastIndexOf("LOCATE("), sql);
+    }
+
+    @Test
+    void splitFieldsNullSourceGuardRemainsWithDelimiterFallback() throws Exception {
+        SqlBuildResult result = factory.build(opsDag("split_fields", "p1", "{"
+                + "\"alias\":\"a\",\"field\":\"path\",\"delimiter\":\"||\","
+                + "\"keepOriginal\":true,\"trim\":false,\"emptyAsNull\":false,"
+                + "\"parts\":[{\"index\":1,\"output\":\"p1\"}]}"), 101L, "p1");
+        assertTrue(result.getSql().contains("CASE WHEN `a`.`path` IS NULL THEN NULL ELSE "
+                + "IFNULL((CASE WHEN LOCATE('||', `a`.`path`) = 0 THEN `a`.`path` "
+                + "ELSE SPLIT_PART(`a`.`path`, '||', 1) END), '') END AS `p1`"),
+                result.getSql());
+    }
+
+    @Test
+    void splitFieldsRejectsInvalidConfigurations() throws Exception {
+        String[][] cases = {
+                {"{\"alias\":\"a\",\"field\":\"path\",\"delimiter\":\"\","
+                        + "\"parts\":[{\"index\":1,\"output\":\"p1\"}]}",
+                        "SPLIT_DELIMITER_EMPTY"},
+                {"{\"alias\":\"a\",\"field\":\"path\",\"delimiter\":\"/\",\"parts\":[]}",
+                        "SPLIT_PARTS_EMPTY"},
+                {"{\"alias\":\"a\",\"field\":\"path\",\"delimiter\":\"/\","
+                        + "\"parts\":[{\"index\":0,\"output\":\"p1\"}]}", "SPLIT_INDEX_INVALID"},
+                {"{\"alias\":\"a\",\"field\":\"path\",\"delimiter\":\"/\","
+                        + "\"parts\":[{\"index\":1,\"output\":\"p1\"},"
+                        + "{\"index\":1,\"output\":\"p2\"}]}", "SPLIT_INDEX_DUPLICATE"},
+                {"{\"alias\":\"a\",\"field\":\"path\",\"delimiter\":\"/\","
+                        + "\"parts\":[{\"index\":1,\"output\":\"city\"}]}",
+                        "SPLIT_OUTPUT_DUPLICATE"},
+                {"{\"alias\":\"a\",\"field\":\"nope\",\"delimiter\":\"/\","
+                        + "\"parts\":[{\"index\":1,\"output\":\"p1\"}]}", "SPLIT_FIELD_UNKNOWN"},
+        };
+        for (String[] c : cases) {
+            BizException e = assertThrows(BizException.class,
+                    () -> factory.build(opsDag("split_fields", "p1", c[0]), 101L, "p1"), c[0]);
+            assertEquals(4000, e.getErrorCode().getCode(), c[0]);
+            assertEquals(c[1], reason(e), c[0] + " -> " + e.getMessage());
+        }
+    }
+
+    // --------------------------------------------- SplitFieldsToRows
+
+    @Test
+    void splitRowsBuildsOuterExplodeAndPosition() throws Exception {
+        SqlBuildResult result = factory.build(opsDag("split_fields_to_rows", "x1", "{"
+                + "\"alias\":\"a\",\"field\":\"tags\",\"delimiter\":\",\","
+                + "\"output\":\"tag\",\"keepOriginal\":true,\"trim\":true,"
+                + "\"dropEmpty\":false,\"positionOutput\":\"tag_index\"}"), 101L, "x1");
+        String sql = result.getSql();
+        assertTrue(sql.contains("LATERAL VIEW posexplode(IF(`a`.`tags` IS NULL OR "
+                + "`a`.`tags` = '', ARRAY(NULL), SPLIT_BY_STRING(`a`.`tags`, ',')))"), sql);
+        assertTrue(sql.contains("TRIM(`__dm_val`) AS `tag`"), sql);
+        assertTrue(sql.contains("(`__dm_pos` + 1) AS `tag_index`"), sql);
+        assertEquals(8, result.getOutputColumns().size());
+        assertEquals("tag", result.getOutputColumns().get(6).getName());
+        assertEquals("STRING", result.getOutputColumns().get(6).getDorisType());
+        assertEquals("tag_index", result.getOutputColumns().get(7).getName());
+        assertEquals("BIGINT", result.getOutputColumns().get(7).getDorisType());
+    }
+
+    @Test
+    void splitRowsSupportsInPlaceAndDropEmpty() throws Exception {
+        SqlBuildResult result = factory.build(opsDag("split_fields_to_rows", "x1", "{"
+                + "\"alias\":\"a\",\"field\":\"tags\",\"delimiter\":\",\","
+                + "\"output\":\"tags\",\"keepOriginal\":true,\"trim\":true,"
+                + "\"dropEmpty\":true}"), 101L, "x1");
+        String sql = result.getSql();
+        assertTrue(sql.contains("TRIM(`__dm_val`) AS `tags`"), sql);
+        assertTrue(!sql.contains("`a`.`tags`,\n"), sql);
+        assertTrue(sql.contains("WHERE TRIM(`__dm_val`) IS NOT NULL AND "
+                + "TRIM(`__dm_val`) <> ''"), sql);
+        assertEquals(6, result.getOutputColumns().size());
+        assertEquals("STRING", result.getOutputColumns().get(4).getDorisType());
+    }
+
+    @Test
+    void splitRowsRejectsInvalidConfigurations() throws Exception {
+        String[][] cases = {
+                {"{\"alias\":\"a\",\"field\":\"tags\",\"delimiter\":\"\","
+                        + "\"output\":\"tag\"}", "SPLIT_DELIMITER_EMPTY"},
+                {"{\"alias\":\"a\",\"field\":\"tags\",\"delimiter\":\",\","
+                        + "\"output\":\"\"}", "SPLIT_OUTPUT_EMPTY"},
+                {"{\"alias\":\"a\",\"field\":\"tags\",\"delimiter\":\",\","
+                        + "\"output\":\"uid\"}", "SPLIT_OUTPUT_DUPLICATE"},
+                {"{\"alias\":\"a\",\"field\":\"tags\",\"delimiter\":\",\","
+                        + "\"output\":\"tag\",\"positionOutput\":\"tag\"}",
+                        "SPLIT_OUTPUT_DUPLICATE"},
+                {"{\"alias\":\"a\",\"field\":\"nope\",\"delimiter\":\",\","
+                        + "\"output\":\"tag\"}", "SPLIT_FIELD_UNKNOWN"},
+        };
+        for (String[] c : cases) {
+            BizException e = assertThrows(BizException.class,
+                    () -> factory.build(opsDag("split_fields_to_rows", "x1", c[0]), 101L, "x1"),
+                    c[0]);
+            assertEquals(4000, e.getErrorCode().getCode(), c[0]);
+            assertEquals(c[1], reason(e), c[0] + " -> " + e.getMessage());
+        }
+    }
+
     private static String repeat(String value, int times) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < times; i++) {

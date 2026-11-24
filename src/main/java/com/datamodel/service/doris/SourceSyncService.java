@@ -90,8 +90,10 @@ public class SourceSyncService {
         boolean recreated = prepareTarget(dorisTable, fingerprint, targets);
 
         long sourceRows = countSource(ds, plainPassword, table, filters);
-        long loaded = streamRows(ds, plainPassword, table, chosen, targets, filters,
-                flowId, runId, nodeId, dorisTable);
+        // Doris 4.1.3 对 0 行结果集的流式游标读取会阻塞到读超时，空表直接跳过拉数。
+        long loaded = sourceRows == 0 ? 0L
+                : streamRows(ds, plainPassword, table, chosen, targets, filters,
+                        flowId, runId, nodeId, dorisTable);
 
         long targetRows = dorisClient.tableRowCount(dorisTable);
         if (sourceRows != targetRows) {

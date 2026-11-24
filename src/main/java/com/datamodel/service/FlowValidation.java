@@ -166,6 +166,8 @@ public final class FlowValidation {
         return "source".equals(type) || "filter".equals(type) || "groupby".equals(type)
                 || "join".equals(type) || "union".equals(type) || "convert".equals(type)
                 || "calculator".equals(type) || "formula".equals(type)
+                || "replace_null".equals(type) || "sort_rows".equals(type)
+                || "split_fields".equals(type) || "split_fields_to_rows".equals(type)
                 || "sink".equals(type);
     }
 

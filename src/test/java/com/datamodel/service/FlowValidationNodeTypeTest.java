@@ -46,6 +46,21 @@ class FlowValidationNodeTypeTest {
     }
 
     @Test
+    void newOperatorTypesAreKnownSingleInputTypes() throws Exception {
+        String nodes = source() + ","
+                + "{\"id\":\"r1\",\"type\":\"replace_null\",\"data\":{\"config\":{"
+                + "\"rules\":[{\"field\":\"a\",\"strategy\":\"MAX\"}]}}},"
+                + "{\"id\":\"o1\",\"type\":\"sort_rows\",\"data\":{\"config\":{}}},"
+                + "{\"id\":\"p1\",\"type\":\"split_fields\",\"data\":{\"config\":{}}},"
+                + "{\"id\":\"x1\",\"type\":\"split_fields_to_rows\",\"data\":{\"config\":{}}}";
+        JsonNode json = dag("{\"nodes\":[" + nodes + "],\"edges\":["
+                + edge("s1", "r1") + "," + edge("r1", "o1") + ","
+                + edge("o1", "p1") + "," + edge("p1", "x1") + "]}");
+
+        assertDoesNotThrow(() -> FlowValidation.validate(json));
+    }
+
+    @Test
     void formulaWithoutUpstreamIsRejected() throws Exception {
         JsonNode json = dag("{\"nodes\":[{\"id\":\"f1\",\"type\":\"formula\","
                 + "\"data\":{\"config\":{\"formulas\":[]}}}],\"edges\":[]}");
