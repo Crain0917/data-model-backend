@@ -24,12 +24,15 @@ import com.datamodel.mapper.FlowRunMapper;
 import com.datamodel.mapper.NodeRunMapper;
 import com.datamodel.mapper.RunLogMapper;
 import com.datamodel.service.doris.DorisClient;
+import com.datamodel.service.doris.DorisNameSanitizer;
 import com.datamodel.service.doris.DorisRegistryRepository;
 import com.datamodel.service.doris.MaterializeResult;
 import com.datamodel.service.doris.SourceSyncService;
 import com.datamodel.service.doris.MaterializeService;
 import com.datamodel.service.doris.SinkWatermarkRepository;
 import com.datamodel.service.doris.SyncResult;
+import com.datamodel.sink.SinkConfig;
+import com.datamodel.sink.SinkField;
 import com.datamodel.sink.SinkProgress;
 import com.datamodel.sink.SinkWriteResult;
 import com.datamodel.sink.SinkWriteService;
@@ -75,6 +78,7 @@ public class FlowRunService {
     private final SinkWatermarkRepository sinkWatermarkRepository;
     private final DorisRegistryRepository registryRepository;
     private final DorisClient dorisClient;
+    private final DorisNameSanitizer nameSanitizer;
     private final ExecutorService executor;
 
     private final Set<Long> runningFlows = ConcurrentHashMap.newKeySet();
@@ -93,6 +97,7 @@ public class FlowRunService {
                           SinkWatermarkRepository sinkWatermarkRepository,
                           DorisRegistryRepository registryRepository,
                           DorisClient dorisClient,
+                          DorisNameSanitizer nameSanitizer,
                           @Qualifier("flowRunExecutor") ExecutorService executor) {
         this.flowService = flowService;
         this.flowMapper = flowMapper;
@@ -108,6 +113,7 @@ public class FlowRunService {
         this.sinkWatermarkRepository = sinkWatermarkRepository;
         this.registryRepository = registryRepository;
         this.dorisClient = dorisClient;
+        this.nameSanitizer = nameSanitizer;
         this.executor = executor;
     }
 
@@ -418,6 +424,10 @@ public class FlowRunService {
     }
 
     private void runMaterialize(FlowRunEntity run, JsonNode dagJson, DagNode node, NodeRunEntity nr) {
+        if (uniqueWithDuplicateTable(node)) {
+            runUniqueRowsWithDuplicateTable(run, dagJson, node, nr);
+            return;
+        }
         SqlBuildResult built = sqlBuilderFactory.build(dagJson, run.getFlowId(), node.id());
         Map<String, Object> params = new LinkedHashMap<>();
         params.put("sql", built.getSql());
@@ -436,6 +446,117 @@ public class FlowRunService {
         }
         writeLog(run.getId(), node.id(), "INFO",
                 "物化完成 → " + result.getTargetTable() + "，输出行数 " + result.getRows());
+    }
+
+    private static boolean uniqueWithDuplicateTable(DagNode node) {
+        return "unique_rows".equals(node.type())
+                && "TABLE".equalsIgnoreCase(node.text("duplicateOutput", "DISCARD"));
+    }
+
+    /**
+     * 行去重 + 重复行写表：ROW_NUMBER() 只物化一次到 __rn 中间表，
+     * 主输出（dm_rn = 1）与重复流（dm_rn &gt; 1）都从该表读取，
+     * 保证 RAND() 单次求值、两条流互补。
+     */
+    private void runUniqueRowsWithDuplicateTable(FlowRunEntity run, JsonNode dagJson,
+                                                 DagNode node, NodeRunEntity nr) {
+        long flowId = run.getFlowId();
+        SqlBuildResult numbered = sqlBuilderFactory.buildUniqueRowsNumbered(dagJson, flowId,
+                node.id());
+        nr.setSqlText(numbered.getDisplaySql());
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("sql", numbered.getSql());
+        params.put("params", numbered.getParams());
+        nr.setParams(JsonUtils.toJson(params));
+        writeLog(run.getId(), node.id(), "INFO",
+                "生成去重行号 SQL：" + safe(numbered.getDisplaySql()));
+
+        String rnTable = nameSanitizer.middleTable(flowId, node.id() + "__rn");
+        MaterializeResult rnResult = materializeService.materializeQuery(flowId, node.id() + "__rn",
+                rnTable, numbered.getOutputColumns(), numbered.getSql(),
+                numbered.getDisplaySql(), numbered.getParams());
+        writeLog(run.getId(), node.id(), "INFO",
+                "去重行号已物化 → " + rnTable + "，共 " + rnResult.getRows() + " 行");
+
+        SqlBuildResult mainBuilt = sqlBuilderFactory.buildUniqueRowsFromNumbered(dagJson, flowId,
+                node.id(), rnTable, false);
+        MaterializeResult result = materializeService.materializeQuery(flowId, node.id(),
+                nameSanitizer.middleTable(flowId, node.id()), mainBuilt.getOutputColumns(),
+                mainBuilt.getSql(), mainBuilt.getDisplaySql(), mainBuilt.getParams());
+        nr.setRowCount(result.getRows());
+        nr.setTargetTable(result.getTargetTable());
+        nr.setSqlText(result.getSql());
+        params.put("sql", mainBuilt.getSql());
+        nr.setParams(JsonUtils.toJson(params));
+        if (result.isRecreated()) {
+            writeLog(run.getId(), node.id(), "WARN",
+                    "表结构变更，已重建中间表 " + result.getTargetTable());
+        }
+        writeLog(run.getId(), node.id(), "INFO",
+                "物化完成 → " + result.getTargetTable() + "，输出行数 " + result.getRows());
+
+        writeDuplicateRows(run, dagJson, node, rnTable);
+    }
+
+    /**
+     * 行去重重复流：从 __rn 表读取 dm_rn &gt; 1 的行物化到本节点 __dup 中间表，
+     * 再复用 Sink 写库逻辑写入 duplicateTarget。失败时节点失败，消息中带目标表名。
+     */
+    private void writeDuplicateRows(FlowRunEntity run, JsonNode dagJson, DagNode node,
+                                    String rnTable) {
+        JsonNode target = node.config().get("duplicateTarget");
+        if (target == null || !target.isObject()) {
+            throw new BizException(ErrorCode.PARAM_ERROR,
+                    "重复行写入目标表时必须配置目标数据源与表",
+                    Collections.singletonMap("nodeId", node.id()));
+        }
+        long dataSourceId = target.path("dataSourceId").asLong(0L);
+        String tableName = target.path("tableName").asText("").trim();
+        String writeMode = target.path("writeMode").asText("APPEND").trim().toUpperCase();
+        boolean autoCreate = !target.has("autoCreate") || target.path("autoCreate").asBoolean(true);
+
+        SqlBuildResult dupBuilt = sqlBuilderFactory.buildUniqueRowsFromNumbered(dagJson,
+                run.getFlowId(), node.id(), rnTable, true);
+        String dupTable = nameSanitizer.middleTable(run.getFlowId(), node.id() + "__dup");
+        MaterializeResult dupResult = materializeService.materializeQuery(run.getFlowId(),
+                node.id() + "__dup", dupTable, dupBuilt.getOutputColumns(),
+                dupBuilt.getSql(), dupBuilt.getDisplaySql(), dupBuilt.getParams());
+        writeLog(run.getId(), node.id(), "INFO",
+                "重复行已物化 → " + dupTable + "，共 " + dupResult.getRows() + " 行");
+
+        SinkConfig config = new SinkConfig();
+        config.setNodeId(node.id());
+        config.setTargetType(resolveDuplicateTargetType(target, dataSourceId));
+        config.setDataSourceId(dataSourceId);
+        config.setTableName(tableName);
+        config.setWriteMode("OVERWRITE".equals(writeMode) ? SinkConfig.OVERWRITE
+                : SinkConfig.APPEND);
+        config.setAutoCreateTable(autoCreate);
+        config.setTableModel(SinkConfig.DUPLICATE);
+        config.setBatchSize(SinkConfig.DEFAULT_BATCH_SIZE);
+
+        SinkProgress progress = new SinkProgress();
+        try {
+            SinkWriteResult written = sinkWriteService.writeTable(run.getFlowId(), run.getId(),
+                    node.id(), dupTable, dupBuilt.getOutputColumns(), config,
+                    (level, message) -> writeLog(run.getId(), node.id(), level, message), progress);
+            writeLog(run.getId(), node.id(), "INFO",
+                    "重复行写入完成 → " + config.targetLabel() + "，写入 " + written.getRows()
+                            + " 行（物化重复行 " + dupResult.getRows() + " 行）");
+        } catch (BizException e) {
+            throw new BizException(e.getErrorCode(),
+                    "重复行写入目标表 " + tableName + " 失败：" + safe(e.getMessage()), e.getData());
+        }
+    }
+
+    private String resolveDuplicateTargetType(JsonNode target, long dataSourceId) {
+        String explicit = target.path("targetType").asText("").trim().toUpperCase();
+        if (!explicit.isEmpty()) {
+            return explicit;
+        }
+        DataSourceEntity ds = dataSourceService.getEntity(dataSourceId);
+        String type = ds.getType() == null ? "" : ds.getType().trim().toUpperCase();
+        return type.isEmpty() ? SinkConfig.DORIS : type;
     }
 
     private void runSink(FlowRunEntity run, JsonNode dagJson, DagNode node, NodeRunEntity nr,

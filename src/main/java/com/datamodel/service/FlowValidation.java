@@ -168,6 +168,8 @@ public final class FlowValidation {
                 || "calculator".equals(type) || "formula".equals(type)
                 || "replace_null".equals(type) || "sort_rows".equals(type)
                 || "split_fields".equals(type) || "split_fields_to_rows".equals(type)
+                || "value_mapper".equals(type) || "unique_rows".equals(type)
+                || "columns_to_rows".equals(type) || "rows_to_columns".equals(type)
                 || "sink".equals(type);
     }
 

@@ -2,8 +2,11 @@ package com.datamodel.sql;
 
 import com.datamodel.common.BizException;
 import com.datamodel.common.ErrorCode;
+import com.datamodel.domain.DataSourceEntity;
+import com.datamodel.service.DataSourceService;
 import com.datamodel.service.doris.DorisNameSanitizer;
 import com.datamodel.service.doris.SourceTableNameService;
+import com.datamodel.service.doris.TypeMappingRegistry;
 import com.fasterxml.jackson.databind.JsonNode;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
@@ -15,6 +18,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 节点 SQL 唯一生成方：预览、执行、日志共用。
@@ -27,16 +31,60 @@ public class SqlBuilderFactory {
 
     private final DorisNameSanitizer nameSanitizer;
     private final SourceTableNameService sourceTableNameService;
+    private final TypeMappingRegistry typeMappingRegistry;
+    private final DataSourceService dataSourceService;
+    /** 数据源方言缓存：类型归一化按数据源只解析一次。 */
+    private final Map<Long, String> dialectCache = new ConcurrentHashMap<>();
 
     public SqlBuilderFactory(DorisNameSanitizer nameSanitizer) {
-        this(nameSanitizer, null);
+        this(nameSanitizer, null, new TypeMappingRegistry(), null);
+    }
+
+    public SqlBuilderFactory(DorisNameSanitizer nameSanitizer,
+                             SourceTableNameService sourceTableNameService) {
+        this(nameSanitizer, sourceTableNameService, new TypeMappingRegistry(), null);
     }
 
     @Autowired
     public SqlBuilderFactory(DorisNameSanitizer nameSanitizer,
-                             SourceTableNameService sourceTableNameService) {
+                             SourceTableNameService sourceTableNameService,
+                             TypeMappingRegistry typeMappingRegistry,
+                             DataSourceService dataSourceService) {
         this.nameSanitizer = nameSanitizer;
         this.sourceTableNameService = sourceTableNameService;
+        this.typeMappingRegistry = typeMappingRegistry;
+        this.dataSourceService = dataSourceService;
+    }
+
+    /** 按数据源方言归一化字段类型；拿不到数据源时按 Doris 规则兜底。 */
+    private String dorisType(Long dataSourceId, String rawType) {
+        return typeMappingRegistry.normalize(dialectOf(dataSourceId), rawType).getDorisType();
+    }
+
+    private String dialectOf(Long dataSourceId) {
+        if (dataSourceId == null || dataSourceService == null) {
+            return null;
+        }
+        String cached = dialectCache.get(dataSourceId);
+        if (cached != null) {
+            return cached.isEmpty() ? null : cached;
+        }
+        String dialect = "";
+        try {
+            DataSourceEntity ds = dataSourceService.getEntity(dataSourceId);
+            if (ds != null && ds.getType() != null) {
+                dialect = ds.getType().trim().toUpperCase(Locale.ROOT);
+            }
+        } catch (RuntimeException e) {
+            dialect = "";
+        }
+        dialectCache.put(dataSourceId, dialect);
+        return dialect.isEmpty() ? null : dialect;
+    }
+
+    /** 输出元数据统一入口：任何来源的类型都先归一化为 Doris 合法类型。 */
+    private OutputColumn column(String name, String rawType) {
+        return new OutputColumn(name, typeMappingRegistry.normalize(null, rawType).getDorisType());
     }
 
     public SqlBuildResult build(JsonNode dagJson, long flowId, String targetNodeId) {
@@ -82,6 +130,14 @@ public class SqlBuilderFactory {
                 return buildSplitFields(node, dag, flowId, missing);
             case "split_fields_to_rows":
                 return buildSplitFieldsToRows(node, dag, flowId, missing);
+            case "value_mapper":
+                return buildValueMapper(node, dag, flowId, missing);
+            case "unique_rows":
+                return buildUniqueRows(node, dag, flowId, missing);
+            case "columns_to_rows":
+                return buildColumnsToRows(node, dag, flowId, missing);
+            case "rows_to_columns":
+                return buildRowsToColumns(node, dag, flowId, missing);
             case "sink":
                 return buildSink(node);
             default:
@@ -587,19 +643,16 @@ public class SqlBuilderFactory {
         final String strategy;
         final String value;
         final String output;
-        final boolean treatEmptyAsNull;
 
-        ReplaceRule(String field, String strategy, String value, String output,
-                    boolean treatEmptyAsNull) {
+        ReplaceRule(String field, String strategy, String value, String output) {
             this.field = field;
             this.strategy = strategy;
             this.value = value;
             this.output = output;
-            this.treatEmptyAsNull = treatEmptyAsNull;
         }
 
         boolean inPlace(String columnName) {
-            return output.isEmpty() || output.equals(columnName);
+            return output.isEmpty() || output.equalsIgnoreCase(columnName);
         }
     }
 
@@ -640,12 +693,12 @@ public class SqlBuilderFactory {
             return rules;
         }
         for (JsonNode r : arr) {
+            // treatEmptyAsNull 已废弃：旧 DAG 里的该字段直接忽略，只替换 NULL。
             rules.add(new ReplaceRule(
                     r.path("field").asText("").trim(),
                     r.path("strategy").asText("").trim().toUpperCase(Locale.ROOT),
                     r.hasNonNull("value") ? r.get("value").asText() : null,
-                    r.path("output").asText("").trim(),
-                    r.path("treatEmptyAsNull").asBoolean(false)));
+                    r.path("output").asText("").trim()));
         }
         return rules;
     }
@@ -728,50 +781,83 @@ public class SqlBuilderFactory {
         }
     }
 
-    private static String replaceExpression(ReplaceRule rule, OutputColumn column,
-                                            String alias, String upTable,
-                                            Identifiers.QuoteStyle q) {
+    private String replaceExpression(ReplaceRule rule, OutputColumn column,
+                                     String alias, Map<ReplaceRule, String> statAliases,
+                                     Identifiers.QuoteStyle q) {
         String ref = Identifiers.ref(alias, column.getName(), q);
         boolean numeric = isNumericType(column.getDorisType());
         if ("VALUE".equals(rule.strategy)) {
-            String base = ref;
-            if (isStringType(column.getDorisType()) && rule.treatEmptyAsNull) {
-                base = "NULLIF(" + ref + ", '')";
-            }
             String literal = numeric ? rule.value.trim() : stringLiteral(rule.value);
-            return "COALESCE(" + base + ", " + literal + ")";
+            return "COALESCE(" + ref + ", " + literal + ")";
         }
-        String agg;
-        switch (rule.strategy) {
-            case "MAX":
-                agg = "SELECT MAX(" + Identifiers.quote(column.getName(), q)
-                        + ") FROM " + upTable + " AS `dm_agg`";
-                break;
-            case "MIN":
-                agg = "SELECT MIN(" + Identifiers.quote(column.getName(), q)
-                        + ") FROM " + upTable + " AS `dm_agg`";
-                break;
-            case "AVG":
-                agg = "SELECT AVG(" + Identifiers.quote(column.getName(), q)
-                        + ") FROM " + upTable + " AS `dm_agg`";
-                break;
-            case "MEDIAN":
-                agg = "SELECT PERCENTILE(" + Identifiers.quote(column.getName(), q)
-                        + ", 0.5) FROM " + upTable + " AS `dm_agg`";
-                break;
-            case "MODE":
-                agg = "SELECT " + Identifiers.quote(column.getName(), q)
-                        + " FROM " + upTable + " AS `dm_agg` WHERE "
-                        + Identifiers.quote(column.getName(), q)
-                        + " IS NOT NULL GROUP BY " + Identifiers.quote(column.getName(), q)
-                        + " ORDER BY COUNT(*) DESC, " + Identifiers.quote(column.getName(), q)
-                        + " ASC LIMIT 1";
-                break;
-            default:
-                throw new IllegalStateException("unreachable strategy " + rule.strategy);
-        }
-        return "CAST(COALESCE(" + ref + ", (" + agg + ")) AS "
+        String statRef = "`dm_stat`." + Identifiers.quote(statAliases.get(rule), q);
+        return "CAST(COALESCE(" + ref + ", " + statRef + ") AS "
                 + replaceOutputType(rule, column) + ")";
+    }
+
+    /**
+     * 统计值统一预计算到单个 dm_stat CTE，避免 COALESCE 内逐行子查询，且必须恒为 1 行。
+     * MODE 是标量子查询、不含聚合函数；若全为 MODE 仍带 FROM，CTE 会按上游行数逐行返回，
+     * CROSS JOIN 会把主输出放大 N 倍。故无聚合统计时生成不带 FROM 的 SELECT；
+     * 含聚合统计时聚合函数无 GROUP BY，同样恒为 1 行。
+     */
+    private String replaceStatCte(List<ReplaceRule> rules, Map<ReplaceRule, String> statAliases,
+                                  String upTable, Identifiers.QuoteStyle q) {
+        List<String> selects = new ArrayList<>();
+        int modeIndex = 0;
+        boolean hasAggregate = false;
+        for (ReplaceRule rule : rules) {
+            String statAlias = statAliases.get(rule);
+            if (statAlias == null) {
+                continue;
+            }
+            String col = Identifiers.quote(rule.field, q);
+            String expr;
+            switch (rule.strategy) {
+                case "MAX":
+                    expr = "MAX(" + col + ")";
+                    hasAggregate = true;
+                    break;
+                case "MIN":
+                    expr = "MIN(" + col + ")";
+                    hasAggregate = true;
+                    break;
+                case "AVG":
+                    expr = "AVG(" + col + ")";
+                    hasAggregate = true;
+                    break;
+                case "MEDIAN":
+                    expr = "PERCENTILE(" + col + ", 0.5)";
+                    hasAggregate = true;
+                    break;
+                case "MODE":
+                    // 并列取最小、排除 NULL
+                    expr = "(SELECT " + col + " FROM " + upTable + " AS `dm_mode_" + modeIndex++
+                            + "` WHERE " + col + " IS NOT NULL GROUP BY " + col
+                            + " ORDER BY COUNT(*) DESC, " + col + " ASC LIMIT 1)";
+                    break;
+                default:
+                    throw new IllegalStateException("unreachable strategy " + rule.strategy);
+            }
+            selects.add(expr + " AS " + Identifiers.quote(statAlias, q));
+        }
+        StringBuilder cte = new StringBuilder("WITH dm_stat AS (\n  SELECT ")
+                .append(String.join(",\n         ", selects));
+        if (hasAggregate) {
+            cte.append("\n  FROM ").append(upTable);
+        }
+        return cte.append("\n)\n").toString();
+    }
+
+    private String statAlias(String strategy, String field, Set<String> used) {
+        String sanitized = field.replaceAll("[^A-Za-z0-9_]", "_");
+        String base = "dm_" + strategy.toLowerCase(Locale.ROOT) + "_" + sanitized;
+        String name = base;
+        int suffix = 2;
+        while (!used.add(name.toLowerCase(Locale.ROOT))) {
+            name = base + "_" + suffix++;
+        }
+        return name;
     }
 
     private SqlBuildResult buildReplaceNull(DagNode node, Dag dag, long flowId, Set<String> missing) {
@@ -787,11 +873,20 @@ public class SqlBuilderFactory {
         List<ReplaceRule> rules = parseReplaceRules(node);
         validateReplaceRules(node, rules, upCols);
 
+        Map<ReplaceRule, String> statAliases = new LinkedHashMap<>();
+        Set<String> takenAliases = new LinkedHashSet<>();
+        for (ReplaceRule rule : rules) {
+            if ("VALUE".equals(rule.strategy)) {
+                continue;
+            }
+            statAliases.put(rule, statAlias(rule.strategy, rule.field, takenAliases));
+        }
+
         List<String> selects = new ArrayList<>();
         for (OutputColumn column : upCols) {
             ReplaceRule rule = findReplaceRule(rules, column.getName());
             if (rule != null && rule.inPlace(column.getName())) {
-                selects.add(replaceExpression(rule, column, alias, upTable, q)
+                selects.add(replaceExpression(rule, column, alias, statAliases, q)
                         + " AS " + Identifiers.quote(column.getName(), q));
             } else {
                 selects.add(Identifiers.ref(alias, column.getName(), q));
@@ -802,15 +897,23 @@ public class SqlBuilderFactory {
             if (rule.inPlace(column.getName())) {
                 continue;
             }
-            selects.add(replaceExpression(rule, column, alias, upTable, q)
+            selects.add(replaceExpression(rule, column, alias, statAliases, q)
                     + " AS " + Identifiers.quote(rule.output, q));
         }
 
-        String sql = "SELECT\n  " + String.join(",\n  ", selects)
-                + "\nFROM " + upTable + " AS " + Identifiers.quote(alias, q);
+        StringBuilder sql = new StringBuilder();
+        if (!statAliases.isEmpty()) {
+            sql.append(replaceStatCte(rules, statAliases, upTable, q));
+        }
+        sql.append("SELECT\n  ").append(String.join(",\n  ", selects))
+                .append("\nFROM ").append(upTable).append(" AS ")
+                .append(Identifiers.quote(alias, q));
+        if (!statAliases.isEmpty()) {
+            sql.append("\nCROSS JOIN `dm_stat`");
+        }
         SqlBuildResult r = new SqlBuildResult();
-        r.setSql(sql);
-        r.setDisplaySql(sql);
+        r.setSql(sql.toString());
+        r.setDisplaySql(sql.toString());
         return r;
     }
 
@@ -1342,6 +1445,891 @@ public class SqlBuilderFactory {
         return r;
     }
 
+    // ------------------------------------------------------- value mapper
+
+    private static final Set<String> VALUE_UNMATCHED = new LinkedHashSet<>(
+            java.util.Arrays.asList("KEEP", "VALUE", "NULL"));
+
+    private static final class ValueMapping {
+        final String from;
+        final String to;
+
+        ValueMapping(String from, String to) {
+            this.from = from;
+            this.to = to;
+        }
+    }
+
+    private static final class ValueRule {
+        final String field;
+        final String output;
+        final String unmatched;
+        final String unmatchedValue;
+        final List<ValueMapping> mappings;
+
+        ValueRule(String field, String output, String unmatched, String unmatchedValue,
+                  List<ValueMapping> mappings) {
+            this.field = field;
+            this.output = output;
+            this.unmatched = unmatched;
+            this.unmatchedValue = unmatchedValue;
+            this.mappings = mappings;
+        }
+
+        boolean inPlace(String columnName) {
+            return output.isEmpty() || output.equalsIgnoreCase(columnName);
+        }
+    }
+
+    private List<ValueRule> parseValueRules(DagNode node) {
+        List<ValueRule> rules = new ArrayList<>();
+        JsonNode arr = node.array("rules");
+        if (arr == null) {
+            return rules;
+        }
+        for (JsonNode r : arr) {
+            List<ValueMapping> mappings = new ArrayList<>();
+            JsonNode list = r.get("mappings");
+            if (list != null && list.isArray()) {
+                for (JsonNode m : list) {
+                    mappings.add(new ValueMapping(
+                            m.hasNonNull("from") ? m.get("from").asText() : null,
+                            m.hasNonNull("to") ? m.get("to").asText() : ""));
+                }
+            }
+            String unmatched = r.path("unmatched").asText("").trim().toUpperCase(Locale.ROOT);
+            rules.add(new ValueRule(
+                    r.path("field").asText("").trim(),
+                    r.path("output").asText("").trim(),
+                    unmatched.isEmpty() ? "KEEP" : unmatched,
+                    r.hasNonNull("unmatchedValue") ? r.get("unmatchedValue").asText() : null,
+                    mappings));
+        }
+        return rules;
+    }
+
+    private static String mappingKey(String value, boolean numeric) {
+        if (value == null) {
+            return "";
+        }
+        String v = value.trim();
+        if (!numeric) {
+            return value;
+        }
+        try {
+            return new java.math.BigDecimal(v).stripTrailingZeros().toPlainString();
+        } catch (NumberFormatException e) {
+            return v;
+        }
+    }
+
+    private static String valueLiteral(boolean numeric, String value) {
+        return numeric ? value.trim() : stringLiteral(value == null ? "" : value);
+    }
+
+    private void validateValueRules(DagNode node, List<ValueRule> rules, List<OutputColumn> upCols) {
+        if (upCols.isEmpty()) {
+            throw paramError(node, "VALUE_MAPPER_UPSTREAM_UNKNOWN",
+                    "值映射无法确定上游字段，请先配置上游节点并获取字段");
+        }
+        if (rules.isEmpty()) {
+            throw paramError(node, "VALUE_MAPPER_RULES_EMPTY", "值映射至少需要配置一条字段规则");
+        }
+        Set<String> fields = new LinkedHashSet<>();
+        Set<String> outputs = new LinkedHashSet<>();
+        for (OutputColumn column : upCols) {
+            outputs.add(column.getName().toLowerCase(Locale.ROOT));
+        }
+        for (ValueRule rule : rules) {
+            if (rule.field.isEmpty()) {
+                throw paramError(node, "VALUE_MAPPER_FIELD_MISSING", "值映射的字段不能为空");
+            }
+            if (!fields.add(rule.field.toLowerCase(Locale.ROOT))) {
+                throw paramError(node, "VALUE_MAPPER_FIELD_DUPLICATE",
+                        "同一字段只能配置一条值映射规则：" + rule.field);
+            }
+            OutputColumn column = findColumn(upCols, rule.field);
+            if (column == null) {
+                throw paramError(node, "VALUE_MAPPER_FIELD_UNKNOWN",
+                        "值映射引用了不存在的字段：" + rule.field);
+            }
+            boolean numeric = isNumericType(column.getDorisType());
+            if (!VALUE_UNMATCHED.contains(rule.unmatched)) {
+                throw paramError(node, "VALUE_MAPPER_UNMATCHED_INVALID",
+                        "值映射不支持的未匹配策略：" + rule.unmatched);
+            }
+            if ("VALUE".equals(rule.unmatched) && rule.unmatchedValue == null) {
+                throw paramError(node, "VALUE_MAPPER_UNMATCHED_VALUE_MISSING",
+                        "字段 " + column.getName() + " 选择「替换为指定值」时必须填写替换值");
+            }
+            if (numeric && "VALUE".equals(rule.unmatched)
+                    && !isNumericLiteral(rule.unmatchedValue)) {
+                throw paramError(node, "VALUE_MAPPER_MAPPING_NOT_NUMERIC",
+                        "字段 " + column.getName() + " 的值必须是数字：" + rule.unmatchedValue);
+            }
+            if (rule.mappings.isEmpty()) {
+                throw paramError(node, "VALUE_MAPPER_MAPPINGS_EMPTY",
+                        "字段 " + column.getName() + " 至少需要一条值映射");
+            }
+            Set<String> seen = new LinkedHashSet<>();
+            for (ValueMapping mapping : rule.mappings) {
+                if (mapping.from == null || mapping.from.trim().isEmpty()) {
+                    throw paramError(node, "VALUE_MAPPER_FROM_MISSING",
+                            "字段 " + column.getName() + " 的映射来源值不能为空");
+                }
+                if (numeric && (!isNumericLiteral(mapping.from)
+                        || !isNumericLiteral(mapping.to))) {
+                    String bad = !isNumericLiteral(mapping.from) ? mapping.from : mapping.to;
+                    throw paramError(node, "VALUE_MAPPER_MAPPING_NOT_NUMERIC",
+                            "字段 " + column.getName() + " 的值必须是数字：" + bad);
+                }
+                if (!seen.add(mappingKey(mapping.from, numeric))) {
+                    throw paramError(node, "VALUE_MAPPER_FROM_DUPLICATE",
+                            "字段 " + column.getName() + " 的映射来源值重复：" + mapping.from);
+                }
+            }
+            if (rule.inPlace(column.getName())) {
+                continue;
+            }
+            String out = requireOutputName(node, rule.output, "VALUE_MAPPER_OUTPUT_INVALID", "值映射");
+            if (!outputs.add(out.toLowerCase(Locale.ROOT))) {
+                throw paramError(node, "VALUE_MAPPER_OUTPUT_DUPLICATE", "值映射输出字段重名：" + out);
+            }
+        }
+    }
+
+    private String valueMapperExpression(ValueRule rule, OutputColumn column, String alias,
+                                         Identifiers.QuoteStyle q) {
+        boolean numeric = isNumericType(column.getDorisType());
+        String ref = Identifiers.ref(alias, column.getName(), q);
+        StringBuilder expr = new StringBuilder("CASE");
+        for (ValueMapping mapping : rule.mappings) {
+            expr.append(" WHEN ").append(ref).append(" = ")
+                    .append(valueLiteral(numeric, mapping.from))
+                    .append(" THEN ").append(valueLiteral(numeric, mapping.to));
+        }
+        switch (rule.unmatched) {
+            case "VALUE":
+                expr.append(" ELSE ").append(valueLiteral(numeric, rule.unmatchedValue));
+                break;
+            case "NULL":
+                expr.append(" ELSE NULL");
+                break;
+            default:
+                expr.append(" ELSE ").append(ref);
+                break;
+        }
+        expr.append(" END");
+        return "CAST(" + expr + " AS " + column.getDorisType() + ")";
+    }
+
+    private SqlBuildResult buildValueMapper(DagNode node, Dag dag, long flowId,
+                                            Set<String> missing) {
+        DagNode up = dag.firstUpstream(node.id());
+        String upTable = up == null ? "<missing_upstream>" : tableOf(up, dag, flowId, missing);
+        if (up == null) {
+            missing.add(node.id() + ":no-upstream");
+        }
+        String alias = Identifiers.requireAlias(node.text("alias", "a"), "a");
+        Identifiers.QuoteStyle q = Identifiers.QuoteStyle.BACKTICK;
+        List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                : outputColumns(up, dag, flowId, missing, 0);
+        List<ValueRule> rules = parseValueRules(node);
+        validateValueRules(node, rules, upCols);
+
+        List<String> selects = new ArrayList<>();
+        for (OutputColumn column : upCols) {
+            ValueRule rule = findValueRule(rules, column.getName());
+            if (rule != null && rule.inPlace(column.getName())) {
+                selects.add(valueMapperExpression(rule, column, alias, q)
+                        + " AS " + Identifiers.quote(column.getName(), q));
+            } else {
+                selects.add(Identifiers.ref(alias, column.getName(), q));
+            }
+        }
+        for (ValueRule rule : rules) {
+            OutputColumn column = findColumn(upCols, rule.field);
+            if (rule.inPlace(column.getName())) {
+                continue;
+            }
+            selects.add(valueMapperExpression(rule, column, alias, q)
+                    + " AS " + Identifiers.quote(rule.output, q));
+        }
+
+        String sql = "SELECT\n  " + String.join(",\n  ", selects)
+                + "\nFROM " + upTable + " AS " + Identifiers.quote(alias, q);
+        SqlBuildResult r = new SqlBuildResult();
+        r.setSql(sql);
+        r.setDisplaySql(sql);
+        return r;
+    }
+
+    private static ValueRule findValueRule(List<ValueRule> rules, String column) {
+        for (ValueRule rule : rules) {
+            if (rule.field.equalsIgnoreCase(column)) {
+                return rule;
+            }
+        }
+        return null;
+    }
+
+    // -------------------------------------------------------- unique rows
+
+    private static final Set<String> UNIQUE_MODES = new LinkedHashSet<>(
+            java.util.Arrays.asList("SIMPLE", "RULE"));
+    private static final Set<String> UNIQUE_DUPLICATE_OUTPUT = new LinkedHashSet<>(
+            java.util.Arrays.asList("DISCARD", "TABLE"));
+    private static final Set<String> DUPLICATE_TARGET_TYPES = new LinkedHashSet<>(
+            java.util.Arrays.asList("DORIS", "MYSQL", "DM8", "ORACLE"));
+
+    private static final class UniqueConfig {
+        String mode;
+        List<String> keyFields;
+        boolean ignoreCase;
+        List<SortKey> orderBy;
+        String duplicateOutput;
+        JsonNode duplicateTarget;
+    }
+
+    private UniqueConfig parseUnique(DagNode node) {
+        UniqueConfig c = new UniqueConfig();
+        String mode = node.text("mode", "SIMPLE").trim().toUpperCase(Locale.ROOT);
+        c.mode = mode.isEmpty() ? "SIMPLE" : mode;
+        c.keyFields = fieldNameList(node.array("keyFields"));
+        c.ignoreCase = node.boolValue("ignoreCase", false);
+        c.orderBy = parseSortKeys(node.array("orderBy"));
+        String duplicateOutput = node.text("duplicateOutput", "DISCARD")
+                .trim().toUpperCase(Locale.ROOT);
+        c.duplicateOutput = duplicateOutput.isEmpty() ? "DISCARD" : duplicateOutput;
+        JsonNode target = node.config().get("duplicateTarget");
+        c.duplicateTarget = target != null && target.isObject() ? target : null;
+        return c;
+    }
+
+    private void validateUnique(DagNode node, UniqueConfig c, List<OutputColumn> upCols) {
+        if (upCols.isEmpty()) {
+            throw paramError(node, "UNIQUE_ROWS_UPSTREAM_UNKNOWN",
+                    "行去重无法确定上游字段，请先配置上游节点并获取字段");
+        }
+        if (!UNIQUE_MODES.contains(c.mode)) {
+            throw paramError(node, "UNIQUE_ROWS_MODE_INVALID",
+                    c.mode.isEmpty() ? "行去重的模式不能为空" : "不支持的去重模式：" + c.mode);
+        }
+        if (c.keyFields.isEmpty()) {
+            throw paramError(node, "UNIQUE_ROWS_KEYS_EMPTY", "行去重至少需要一个去重字段");
+        }
+        Set<String> seen = new LinkedHashSet<>();
+        for (String field : c.keyFields) {
+            if (field.isEmpty()) {
+                throw paramError(node, "UNIQUE_ROWS_KEYS_EMPTY", "行去重的去重字段不能为空");
+            }
+            if (findColumn(upCols, field) == null) {
+                throw paramError(node, "UNIQUE_ROWS_FIELD_UNKNOWN",
+                        "行去重引用了不存在的字段：" + field);
+            }
+            if (!seen.add(field.toLowerCase(Locale.ROOT))) {
+                throw paramError(node, "UNIQUE_ROWS_KEY_DUPLICATE", "行去重的去重字段重复：" + field);
+            }
+        }
+        if ("RULE".equals(c.mode)) {
+            if (c.orderBy.isEmpty()) {
+                throw paramError(node, "UNIQUE_ROWS_ORDER_EMPTY",
+                        "按规则去重时至少需要一个排序字段");
+            }
+            validateSortKeys(node, c.orderBy, upCols, "行去重排序", false);
+        }
+        if (!UNIQUE_DUPLICATE_OUTPUT.contains(c.duplicateOutput)) {
+            throw paramError(node, "UNIQUE_ROWS_DUPLICATE_OUTPUT_INVALID",
+                    "不支持的重复行处理方式：" + c.duplicateOutput);
+        }
+        if ("TABLE".equals(c.duplicateOutput)) {
+            JsonNode t = c.duplicateTarget;
+            if (t == null) {
+                throw paramError(node, "UNIQUE_ROWS_DUPLICATE_TARGET_MISSING",
+                        "重复行写入目标表时必须配置目标数据源与表");
+            }
+            if (t.path("dataSourceId").asLong(0L) <= 0L) {
+                throw paramError(node, "UNIQUE_ROWS_DUPLICATE_TARGET_INVALID",
+                        "重复行写入目标表时必须选择目标数据源");
+            }
+            String table = t.path("tableName").asText("").trim();
+            if (table.isEmpty()) {
+                throw paramError(node, "UNIQUE_ROWS_DUPLICATE_TARGET_INVALID",
+                        "重复行写入目标表时必须填写目标表名");
+            }
+            String writeMode = t.path("writeMode").asText("APPEND").trim().toUpperCase(Locale.ROOT);
+            if (!"APPEND".equals(writeMode) && !"OVERWRITE".equals(writeMode)) {
+                throw paramError(node, "UNIQUE_ROWS_DUPLICATE_TARGET_INVALID",
+                        "重复行写入不支持的模式：" + writeMode);
+            }
+            String targetType = t.path("targetType").asText("DORIS").trim().toUpperCase(Locale.ROOT);
+            if (!DUPLICATE_TARGET_TYPES.contains(targetType)) {
+                throw paramError(node, "UNIQUE_ROWS_DUPLICATE_TARGET_INVALID",
+                        "重复行写入不支持的目标类型：" + targetType);
+            }
+        }
+    }
+
+    private static boolean uniqueDistinctOptimized(UniqueConfig c, List<OutputColumn> upCols) {
+        if ("TABLE".equals(c.duplicateOutput) || c.ignoreCase) {
+            return false;
+        }
+        if (c.keyFields.size() != upCols.size()) {
+            return false;
+        }
+        Set<String> keys = new LinkedHashSet<>();
+        for (String field : c.keyFields) {
+            keys.add(field.toLowerCase(Locale.ROOT));
+        }
+        for (OutputColumn column : upCols) {
+            if (!keys.contains(column.getName().toLowerCase(Locale.ROOT))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** 去重分区与排序片段，主输出与行号物化共用，避免两处规则漂移。 */
+    private static final class UniqueWindow {
+        final List<String> partition;
+        final String order;
+
+        UniqueWindow(List<String> partition, String order) {
+            this.partition = partition;
+            this.order = order;
+        }
+    }
+
+    private UniqueWindow uniqueWindow(UniqueConfig c, List<OutputColumn> upCols,
+                                      Identifiers.QuoteStyle q) {
+        List<String> partition = new ArrayList<>();
+        for (String field : c.keyFields) {
+            OutputColumn column = findColumn(upCols, field);
+            String ref = Identifiers.ref("a", column.getName(), q);
+            if (c.ignoreCase && isStringType(column.getDorisType())) {
+                partition.add("LOWER(CAST(" + ref + " AS STRING))");
+            } else {
+                partition.add(ref);
+            }
+        }
+        String order;
+        if ("RULE".equals(c.mode)) {
+            List<String> orders = new ArrayList<>();
+            for (SortKey key : c.orderBy) {
+                OutputColumn column = findColumn(upCols, key.field);
+                orders.add(Identifiers.ref("a", column.getName(), q) + " " + key.direction);
+            }
+            order = String.join(", ", orders);
+        } else {
+            order = "RAND()";
+        }
+        return new UniqueWindow(partition, order);
+    }
+
+    private static List<String> uniqueSelects(List<OutputColumn> upCols, UniqueWindow window,
+                                             Identifiers.QuoteStyle q) {
+        List<String> inner = new ArrayList<>();
+        for (OutputColumn column : upCols) {
+            inner.add(Identifiers.ref("a", column.getName(), q));
+        }
+        inner.add("ROW_NUMBER() OVER (PARTITION BY " + String.join(", ", window.partition)
+                + " ORDER BY " + window.order + ") AS `dm_rn`");
+        return inner;
+    }
+
+    private String uniqueSql(UniqueConfig c, List<OutputColumn> upCols, String upTable,
+                             Identifiers.QuoteStyle q) {
+        if (uniqueDistinctOptimized(c, upCols)) {
+            List<String> distinct = new ArrayList<>();
+            for (OutputColumn column : upCols) {
+                distinct.add(Identifiers.ref("a", column.getName(), q));
+            }
+            return "SELECT DISTINCT\n  " + String.join(",\n  ", distinct)
+                    + "\nFROM " + upTable + " AS `a`";
+        }
+        List<String> outer = new ArrayList<>();
+        for (OutputColumn column : upCols) {
+            outer.add(Identifiers.ref("t", column.getName(), q));
+        }
+        String body = "SELECT\n  "
+                + String.join(",\n  ", uniqueSelects(upCols, uniqueWindow(c, upCols, q), q))
+                + "\nFROM " + upTable + " AS `a`";
+        return "SELECT\n  " + String.join(",\n  ", outer)
+                + "\nFROM (\n  " + body.replace("\n", "\n  ")
+                + "\n) AS `t`"
+                + "\nWHERE `t`.`dm_rn` = 1";
+    }
+
+    /**
+     * dm_rn 一次求值：输出上游字段 + dm_rn，物化到 __rn 中间表后主输出与重复流共用，
+     * 避免两条流各自重算 RAND() 导致保留集与重复集不互补。
+     */
+    private String uniqueNumberedSql(UniqueConfig c, List<OutputColumn> upCols, String upTable,
+                                     Identifiers.QuoteStyle q) {
+        return "SELECT\n  "
+                + String.join(",\n  ", uniqueSelects(upCols, uniqueWindow(c, upCols, q), q))
+                + "\nFROM " + upTable + " AS `a`";
+    }
+
+    private SqlBuildResult buildUniqueRows(DagNode node, Dag dag, long flowId,
+                                           Set<String> missing) {
+        DagNode up = dag.firstUpstream(node.id());
+        String upTable = up == null ? "<missing_upstream>" : tableOf(up, dag, flowId, missing);
+        if (up == null) {
+            missing.add(node.id() + ":no-upstream");
+        }
+        Identifiers.QuoteStyle q = Identifiers.QuoteStyle.BACKTICK;
+        List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                : outputColumns(up, dag, flowId, missing, 0);
+        UniqueConfig config = parseUnique(node);
+        validateUnique(node, config, upCols);
+
+        String sql = uniqueSql(config, upCols, upTable, q);
+        SqlBuildResult r = new SqlBuildResult();
+        r.setSql(sql);
+        r.setDisplaySql(sql);
+        return r;
+    }
+
+    private DagNode requireUniqueNode(JsonNode dagJson, String nodeId) {
+        Dag dag = Dag.parse(dagJson);
+        DagNode node = dag.node(nodeId);
+        if (node == null || !"unique_rows".equals(node.type())) {
+            throw new BizException(ErrorCode.DAG_INVALID, "节点不是行去重节点：" + nodeId,
+                    java.util.Collections.singletonMap("nodeId", nodeId));
+        }
+        return node;
+    }
+
+    /**
+     * 行去重 TABLE 分流：一次求值 ROW_NUMBER()，输出上游字段 + dm_rn，供物化到 __rn 中间表。
+     * 返回的 outputColumns 末尾为 dm_rn（BIGINT），仅用于物化，不得写入下游或重复目标表。
+     */
+    public SqlBuildResult buildUniqueRowsNumbered(JsonNode dagJson, long flowId, String nodeId) {
+        DagNode node = requireUniqueNode(dagJson, nodeId);
+        Dag dag = Dag.parse(dagJson);
+        Set<String> missing = new LinkedHashSet<>();
+        DagNode up = dag.firstUpstream(node.id());
+        String upTable = up == null ? "<missing_upstream>" : tableOf(up, dag, flowId, missing);
+        Identifiers.QuoteStyle q = Identifiers.QuoteStyle.BACKTICK;
+        List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                : outputColumns(up, dag, flowId, missing, 0);
+        UniqueConfig config = parseUnique(node);
+        validateUnique(node, config, upCols);
+        String sql = uniqueNumberedSql(config, upCols, upTable, q);
+        SqlBuildResult r = new SqlBuildResult();
+        r.setNodeId(node.id());
+        r.setNodeType(node.type());
+        r.setSql(sql);
+        r.setDisplaySql(sql);
+        List<OutputColumn> columns = new ArrayList<>(upCols);
+        columns.add(new OutputColumn("dm_rn", "BIGINT"));
+        r.setOutputColumns(columns);
+        return r;
+    }
+
+    /**
+     * 从已物化的 dm_rn 表分流：主输出取 dm_rn = 1，重复流取 dm_rn &gt; 1。
+     * 两条流不重算 RAND()，天然互补；输出列只含上游字段。
+     */
+    public SqlBuildResult buildUniqueRowsFromNumbered(JsonNode dagJson, long flowId, String nodeId,
+                                                      String rnTable, boolean duplicatesOnly) {
+        DagNode node = requireUniqueNode(dagJson, nodeId);
+        Dag dag = Dag.parse(dagJson);
+        Set<String> missing = new LinkedHashSet<>();
+        DagNode up = dag.firstUpstream(node.id());
+        Identifiers.QuoteStyle q = Identifiers.QuoteStyle.BACKTICK;
+        List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                : outputColumns(up, dag, flowId, missing, 0);
+        UniqueConfig config = parseUnique(node);
+        validateUnique(node, config, upCols);
+        List<String> selects = new ArrayList<>();
+        for (OutputColumn column : upCols) {
+            selects.add(Identifiers.ref("t", column.getName(), q));
+        }
+        String sql = "SELECT\n  " + String.join(",\n  ", selects)
+                + "\nFROM " + Identifiers.quote(rnTable, q) + " AS `t`"
+                + "\nWHERE `t`.`dm_rn` " + (duplicatesOnly ? "> 1" : "= 1");
+        SqlBuildResult r = new SqlBuildResult();
+        r.setNodeId(node.id());
+        r.setNodeType(node.type());
+        r.setSql(sql);
+        r.setDisplaySql(sql);
+        r.setOutputColumns(upCols);
+        return r;
+    }
+
+    // ----------------------------------------------------- columns to rows
+
+    private static final Set<String> C2R_VALUE_TYPES = new LinkedHashSet<>(
+            java.util.Arrays.asList("STRING", "DOUBLE", "BIGINT"));
+
+    private static final class ValueFieldSpec {
+        final String field;
+        final String label;
+
+        ValueFieldSpec(String field, String label) {
+            this.field = field;
+            this.label = label;
+        }
+    }
+
+    private static final class ColumnsToRowsConfig {
+        List<String> keepFields;
+        List<ValueFieldSpec> valueFields;
+        String nameOutput;
+        String valueOutput;
+        String valueType;
+        boolean skipNull;
+    }
+
+    private ColumnsToRowsConfig parseColumnsToRows(DagNode node) {
+        ColumnsToRowsConfig c = new ColumnsToRowsConfig();
+        c.keepFields = fieldNameList(node.array("keepFields"));
+        c.valueFields = new ArrayList<>();
+        JsonNode arr = node.array("valueFields");
+        if (arr != null) {
+            for (JsonNode v : arr) {
+                if (v.isObject()) {
+                    String field = v.path("field").asText("").trim();
+                    String label = v.path("label").asText("");
+                    c.valueFields.add(new ValueFieldSpec(field, label.isEmpty() ? field : label));
+                } else {
+                    String field = v.asText("").trim();
+                    c.valueFields.add(new ValueFieldSpec(field, field));
+                }
+            }
+        }
+        String nameOutput = node.text("nameOutput", "").trim();
+        String valueOutput = node.text("valueOutput", "").trim();
+        c.nameOutput = nameOutput.isEmpty() ? "field_name" : nameOutput;
+        c.valueOutput = valueOutput.isEmpty() ? "field_value" : valueOutput;
+        String valueType = node.text("valueType", "STRING").trim().toUpperCase(Locale.ROOT);
+        c.valueType = valueType.isEmpty() ? "STRING" : valueType;
+        c.skipNull = node.boolValue("skipNull", false);
+        return c;
+    }
+
+    private void validateColumnsToRows(DagNode node, ColumnsToRowsConfig c,
+                                       List<OutputColumn> upCols) {
+        if (upCols.isEmpty()) {
+            throw paramError(node, "COLUMNS_TO_ROWS_UPSTREAM_UNKNOWN",
+                    "列转行无法确定上游字段，请先配置上游节点并获取字段");
+        }
+        if (c.valueFields.isEmpty()) {
+            throw paramError(node, "COLUMNS_TO_ROWS_VALUE_FIELDS_EMPTY",
+                    "列转行至少需要一个值字段");
+        }
+        Set<String> keep = new LinkedHashSet<>();
+        for (String field : c.keepFields) {
+            if (field.isEmpty() || findColumn(upCols, field) == null) {
+                throw paramError(node, "COLUMNS_TO_ROWS_FIELD_UNKNOWN",
+                        "列转行保留了不存在的字段：" + field);
+            }
+            if (!keep.add(field.toLowerCase(Locale.ROOT))) {
+                throw paramError(node, "COLUMNS_TO_ROWS_FIELD_DUPLICATE",
+                        "列转行的保留字段重复：" + field);
+            }
+        }
+        if (!C2R_VALUE_TYPES.contains(c.valueType)) {
+            throw paramError(node, "COLUMNS_TO_ROWS_VALUE_TYPE_INVALID",
+                    "列转行不支持的值类型：" + c.valueType);
+        }
+        Set<String> valueSeen = new LinkedHashSet<>();
+        for (ValueFieldSpec spec : c.valueFields) {
+            if (spec.field.isEmpty()) {
+                throw paramError(node, "COLUMNS_TO_ROWS_VALUE_FIELDS_EMPTY",
+                        "列转行的值字段不能为空");
+            }
+            OutputColumn column = findColumn(upCols, spec.field);
+            if (column == null) {
+                throw paramError(node, "COLUMNS_TO_ROWS_FIELD_UNKNOWN",
+                        "列转行引用了不存在的字段：" + spec.field);
+            }
+            if (!valueSeen.add((spec.field + " " + spec.label).toLowerCase(Locale.ROOT))) {
+                throw paramError(node, "COLUMNS_TO_ROWS_VALUE_FIELD_DUPLICATE",
+                        "列转行的值字段重复：" + spec.field);
+            }
+            if (!"STRING".equals(c.valueType) && !isNumericType(column.getDorisType())) {
+                throw paramError(node, "COLUMNS_TO_ROWS_VALUE_TYPE_UNSUPPORTED",
+                        "值类型为 " + c.valueType + " 时，字段 " + column.getName()
+                                + " 必须是数字类型");
+            }
+        }
+        String nameOutput = requireOutputName(node, c.nameOutput,
+                "COLUMNS_TO_ROWS_OUTPUT_INVALID", "列转行名称列");
+        String valueOutput = requireOutputName(node, c.valueOutput,
+                "COLUMNS_TO_ROWS_OUTPUT_INVALID", "列转行值列");
+        if (nameOutput.equalsIgnoreCase(valueOutput)) {
+            throw paramError(node, "COLUMNS_TO_ROWS_OUTPUT_DUPLICATE",
+                    "列转行的名称列与值列不能重名");
+        }
+        for (String output : java.util.Arrays.asList(nameOutput, valueOutput)) {
+            if (keep.contains(output.toLowerCase(Locale.ROOT))) {
+                throw paramError(node, "COLUMNS_TO_ROWS_OUTPUT_DUPLICATE",
+                        "列转行输出字段与保留字段重名：" + output);
+            }
+        }
+    }
+
+    private List<OutputColumn> columnsToRowsOutputs(List<OutputColumn> upCols,
+                                                    ColumnsToRowsConfig c) {
+        List<OutputColumn> result = new ArrayList<>();
+        for (OutputColumn column : upCols) {
+            if (containsColumnName(c.keepFields, column.getName())) {
+                result.add(column);
+            }
+        }
+        result.add(new OutputColumn(c.nameOutput, "STRING"));
+        result.add(new OutputColumn(c.valueOutput, c.valueType));
+        return result;
+    }
+
+    private static boolean containsColumnName(List<String> names, String name) {
+        for (String n : names) {
+            if (n.equalsIgnoreCase(name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private SqlBuildResult buildColumnsToRows(DagNode node, Dag dag, long flowId,
+                                              Set<String> missing) {
+        DagNode up = dag.firstUpstream(node.id());
+        String upTable = up == null ? "<missing_upstream>" : tableOf(up, dag, flowId, missing);
+        if (up == null) {
+            missing.add(node.id() + ":no-upstream");
+        }
+        String alias = Identifiers.requireAlias(node.text("alias", "a"), "a");
+        Identifiers.QuoteStyle q = Identifiers.QuoteStyle.BACKTICK;
+        List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                : outputColumns(up, dag, flowId, missing, 0);
+        ColumnsToRowsConfig config = parseColumnsToRows(node);
+        validateColumnsToRows(node, config, upCols);
+
+        List<String> branches = new ArrayList<>();
+        for (ValueFieldSpec spec : config.valueFields) {
+            OutputColumn column = findColumn(upCols, spec.field);
+            List<String> selects = new ArrayList<>();
+            for (OutputColumn keep : upCols) {
+                if (containsColumnName(config.keepFields, keep.getName())) {
+                    selects.add(Identifiers.ref(alias, keep.getName(), q));
+                }
+            }
+            selects.add(stringLiteral(spec.label) + " AS " + Identifiers.quote(config.nameOutput, q));
+            selects.add("CAST(" + Identifiers.ref(alias, column.getName(), q) + " AS "
+                    + config.valueType + ") AS " + Identifiers.quote(config.valueOutput, q));
+            StringBuilder branch = new StringBuilder("SELECT\n  ")
+                    .append(String.join(",\n  ", selects))
+                    .append("\nFROM ").append(upTable).append(" AS ")
+                    .append(Identifiers.quote(alias, q));
+            if (config.skipNull) {
+                branch.append("\nWHERE ").append(Identifiers.ref(alias, column.getName(), q))
+                        .append(" IS NOT NULL");
+            }
+            branches.add(branch.toString());
+        }
+        String sql = String.join("\nUNION ALL\n", branches);
+        SqlBuildResult r = new SqlBuildResult();
+        r.setSql(sql);
+        r.setDisplaySql(sql);
+        return r;
+    }
+
+    // ----------------------------------------------------- rows to columns
+
+    private static final Set<String> PIVOT_AGGREGATES = new LinkedHashSet<>(
+            java.util.Arrays.asList("SUM", "MAX", "MIN", "AVG", "COUNT"));
+
+    private static final class PivotValueSpec {
+        final String value;
+        final String output;
+
+        PivotValueSpec(String value, String output) {
+            this.value = value;
+            this.output = output;
+        }
+    }
+
+    private static final class RowsToColumnsConfig {
+        List<String> groupFields;
+        String pivotField;
+        String valueField;
+        String aggregate;
+        List<PivotValueSpec> pivotValues;
+    }
+
+    private RowsToColumnsConfig parseRowsToColumns(DagNode node) {
+        RowsToColumnsConfig c = new RowsToColumnsConfig();
+        c.groupFields = fieldNameList(node.array("groupFields"));
+        c.pivotField = node.text("pivotField", "").trim();
+        c.valueField = node.text("valueField", "").trim();
+        String aggregate = node.text("aggregate", "").trim().toUpperCase(Locale.ROOT);
+        c.aggregate = aggregate;
+        c.pivotValues = new ArrayList<>();
+        JsonNode arr = node.array("pivotValues");
+        if (arr != null) {
+            for (JsonNode v : arr) {
+                c.pivotValues.add(new PivotValueSpec(
+                        v.hasNonNull("value") ? v.get("value").asText() : null,
+                        v.path("output").asText("").trim()));
+            }
+        }
+        return c;
+    }
+
+    private void validateRowsToColumns(DagNode node, RowsToColumnsConfig c,
+                                       List<OutputColumn> upCols) {
+        if (upCols.isEmpty()) {
+            throw paramError(node, "ROWS_TO_COLUMNS_UPSTREAM_UNKNOWN",
+                    "行转列无法确定上游字段，请先配置上游节点并获取字段");
+        }
+        if (c.groupFields.isEmpty()) {
+            throw paramError(node, "ROWS_TO_COLUMNS_GROUP_EMPTY",
+                    "行转列至少需要一个分组字段");
+        }
+        Set<String> groups = new LinkedHashSet<>();
+        for (String field : c.groupFields) {
+            if (field.isEmpty() || findColumn(upCols, field) == null) {
+                throw paramError(node, "ROWS_TO_COLUMNS_FIELD_UNKNOWN",
+                        "行转列引用了不存在的分组字段：" + field);
+            }
+            if (!groups.add(field.toLowerCase(Locale.ROOT))) {
+                throw paramError(node, "ROWS_TO_COLUMNS_GROUP_DUPLICATE",
+                        "行转列的分组字段重复：" + field);
+            }
+        }
+        OutputColumn pivot = c.pivotField.isEmpty() ? null : findColumn(upCols, c.pivotField);
+        if (pivot == null) {
+            throw paramError(node, "ROWS_TO_COLUMNS_PIVOT_FIELD_UNKNOWN",
+                    c.pivotField.isEmpty() ? "行转列的透视字段不能为空"
+                            : "行转列引用了不存在的透视字段：" + c.pivotField);
+        }
+        OutputColumn value = c.valueField.isEmpty() ? null : findColumn(upCols, c.valueField);
+        if (value == null) {
+            throw paramError(node, "ROWS_TO_COLUMNS_VALUE_FIELD_UNKNOWN",
+                    c.valueField.isEmpty() ? "行转列的值字段不能为空"
+                            : "行转列引用了不存在的值字段：" + c.valueField);
+        }
+        if (groups.contains(c.pivotField.toLowerCase(Locale.ROOT))
+                || groups.contains(c.valueField.toLowerCase(Locale.ROOT))) {
+            throw paramError(node, "ROWS_TO_COLUMNS_FIELD_CONFLICT",
+                    "行转列的透视字段与值字段不能同时作为分组字段");
+        }
+        if (pivot.getName().equalsIgnoreCase(value.getName())) {
+            throw paramError(node, "ROWS_TO_COLUMNS_FIELD_CONFLICT",
+                    "行转列的透视字段与值字段不能相同：" + pivot.getName());
+        }
+        if (!PIVOT_AGGREGATES.contains(c.aggregate)) {
+            throw paramError(node, "ROWS_TO_COLUMNS_AGGREGATE_INVALID",
+                    c.aggregate.isEmpty() ? "行转列的聚合方式不能为空"
+                            : "不支持的聚合方式：" + c.aggregate);
+        }
+        if (c.pivotValues.isEmpty()) {
+            throw paramError(node, "ROWS_TO_COLUMNS_VALUES_EMPTY",
+                    "行转列至少需要一个透视值");
+        }
+        boolean numeric = isNumericType(pivot.getDorisType());
+        Set<String> outputs = new LinkedHashSet<>();
+        int index = 0;
+        for (PivotValueSpec spec : c.pivotValues) {
+            index++;
+            if (spec.value == null || spec.value.trim().isEmpty()) {
+                throw paramError(node, "ROWS_TO_COLUMNS_VALUE_EMPTY",
+                        "第 " + index + " 个透视值不能为空");
+            }
+            if (numeric && !isNumericLiteral(spec.value)) {
+                throw paramError(node, "ROWS_TO_COLUMNS_VALUE_INVALID",
+                        "透视字段 " + pivot.getName() + " 是数字类型，透视值必须是数字："
+                                + spec.value);
+            }
+            if (spec.output.isEmpty()) {
+                throw paramError(node, "ROWS_TO_COLUMNS_OUTPUT_EMPTY",
+                        "第 " + index + " 个透视列的输出名不能为空");
+            }
+            String out = requireOutputName(node, spec.output, "ROWS_TO_COLUMNS_OUTPUT_INVALID",
+                    "行转列");
+            if (!outputs.add(out.toLowerCase(Locale.ROOT))) {
+                throw paramError(node, "ROWS_TO_COLUMNS_OUTPUT_DUPLICATE",
+                        "行转列输出字段重名：" + out);
+            }
+            if (groups.contains(out.toLowerCase(Locale.ROOT))) {
+                throw paramError(node, "ROWS_TO_COLUMNS_OUTPUT_DUPLICATE",
+                        "行转列输出字段与分组字段重名：" + out);
+            }
+        }
+    }
+
+    private static String pivotOutputType(String aggregate, String valueType) {
+        switch (aggregate) {
+            case "COUNT":
+                return "BIGINT";
+            case "AVG":
+                return "DOUBLE";
+            case "SUM":
+                return numericOrDouble(valueType);
+            default:
+                return valueType;
+        }
+    }
+
+    private List<OutputColumn> rowsToColumnsOutputs(List<OutputColumn> upCols,
+                                                    RowsToColumnsConfig c) {
+        List<OutputColumn> result = new ArrayList<>();
+        for (String field : c.groupFields) {
+            OutputColumn column = findColumn(upCols, field);
+            result.add(new OutputColumn(column.getName(), column.getDorisType()));
+        }
+        OutputColumn value = findColumn(upCols, c.valueField);
+        for (PivotValueSpec spec : c.pivotValues) {
+            result.add(new OutputColumn(spec.output,
+                    pivotOutputType(c.aggregate, value.getDorisType())));
+        }
+        return result;
+    }
+
+    private SqlBuildResult buildRowsToColumns(DagNode node, Dag dag, long flowId,
+                                              Set<String> missing) {
+        DagNode up = dag.firstUpstream(node.id());
+        String upTable = up == null ? "<missing_upstream>" : tableOf(up, dag, flowId, missing);
+        if (up == null) {
+            missing.add(node.id() + ":no-upstream");
+        }
+        String alias = Identifiers.requireAlias(node.text("alias", "a"), "a");
+        Identifiers.QuoteStyle q = Identifiers.QuoteStyle.BACKTICK;
+        List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                : outputColumns(up, dag, flowId, missing, 0);
+        RowsToColumnsConfig config = parseRowsToColumns(node);
+        validateRowsToColumns(node, config, upCols);
+
+        OutputColumn pivot = findColumn(upCols, config.pivotField);
+        boolean numericPivot = isNumericType(pivot.getDorisType());
+        List<String> selects = new ArrayList<>();
+        List<String> groupRefs = new ArrayList<>();
+        for (String field : config.groupFields) {
+            OutputColumn column = findColumn(upCols, field);
+            String ref = Identifiers.ref(alias, column.getName(), q);
+            selects.add(ref);
+            groupRefs.add(ref);
+        }
+        String valueRef = Identifiers.ref(alias,
+                findColumn(upCols, config.valueField).getName(), q);
+        String pivotRef = Identifiers.ref(alias, pivot.getName(), q);
+        for (PivotValueSpec spec : config.pivotValues) {
+            String literal = numericPivot ? spec.value.trim() : stringLiteral(spec.value);
+            selects.add(config.aggregate + "(CASE WHEN " + pivotRef + " = " + literal
+                    + " THEN " + valueRef + " END) AS " + Identifiers.quote(spec.output, q));
+        }
+        String sql = "SELECT\n  " + String.join(",\n  ", selects)
+                + "\nFROM " + upTable + " AS " + Identifiers.quote(alias, q)
+                + "\nGROUP BY " + String.join(", ", groupRefs);
+        SqlBuildResult r = new SqlBuildResult();
+        r.setSql(sql);
+        r.setDisplaySql(sql);
+        return r;
+    }
+
     private static String requireOutputName(DagNode node, String raw, String reason, String label) {
         try {
             return Identifiers.requireField(raw);
@@ -1383,7 +2371,7 @@ public class SqlBuilderFactory {
                     }
                     String field = s.path("field").asText("");
                     String out = s.path("alias").asText(field);
-                    result.add(new OutputColumn(out, typeOf(upCols, field, s.path("type").asText("STRING"))));
+                    result.add(column(out, typeOf(upCols, field, s.path("type").asText("STRING"))));
                 }
                 return result.isEmpty() ? upCols : result;
             }
@@ -1400,7 +2388,7 @@ public class SqlBuilderFactory {
                     for (JsonNode g : groups) {
                         String field = g.path("field").asText("");
                         String out = g.path("alias").asText(field);
-                        result.add(new OutputColumn(out, typeOf(upCols, field, g.path("type").asText("STRING"))));
+                        result.add(column(out, typeOf(upCols, field, g.path("type").asText("STRING"))));
                     }
                 }
                 JsonNode aggregates = node.array("aggregates");
@@ -1445,7 +2433,7 @@ public class SqlBuilderFactory {
                         String field = p.path("field").asText("");
                         String out = p.path("alias").asText(field);
                         List<OutputColumn> cols = "b".equalsIgnoreCase(side) ? rightCols : leftCols;
-                        result.add(new OutputColumn(out, typeOf(cols, field, p.path("type").asText("STRING"))));
+                        result.add(column(out, typeOf(cols, field, p.path("type").asText("STRING"))));
                     }
                 }
                 return result;
@@ -1472,7 +2460,7 @@ public class SqlBuilderFactory {
                     String name = o.path("name").asText(o.path("target").asText(""));
                     JsonNode mapping = o.has("mapping") ? o.get("mapping") : o.get("sources");
                     String src = mapping == null ? null : mapping.path("a").asText(null);
-                    result.add(new OutputColumn(name, typeOf(firstCols, src == null ? name : src, "STRING")));
+                    result.add(column(name, typeOf(firstCols, src == null ? name : src, "STRING")));
                 }
                 return result;
             }
@@ -1625,6 +2613,49 @@ public class SqlBuilderFactory {
                 }
                 return result;
             }
+            case "value_mapper": {
+                DagNode up = dag.firstUpstream(node.id());
+                List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                        : outputColumns(up, dag, flowId, missing, depth + 1);
+                List<ValueRule> rules = parseValueRules(node);
+                validateValueRules(node, rules, upCols);
+                List<OutputColumn> result = new ArrayList<>(upCols);
+                for (ValueRule rule : rules) {
+                    OutputColumn column = findColumn(upCols, rule.field);
+                    if (!rule.inPlace(column.getName())) {
+                        result.add(new OutputColumn(rule.output, column.getDorisType()));
+                    }
+                }
+                return result;
+            }
+            case "unique_rows": {
+                DagNode up = dag.firstUpstream(node.id());
+                List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                        : outputColumns(up, dag, flowId, missing, depth + 1);
+                UniqueConfig config = parseUnique(node);
+                validateUnique(node, config, upCols);
+                List<OutputColumn> result = new ArrayList<>();
+                for (OutputColumn column : upCols) {
+                    result.add(new OutputColumn(column.getName(), column.getDorisType()));
+                }
+                return result;
+            }
+            case "columns_to_rows": {
+                DagNode up = dag.firstUpstream(node.id());
+                List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                        : outputColumns(up, dag, flowId, missing, depth + 1);
+                ColumnsToRowsConfig config = parseColumnsToRows(node);
+                validateColumnsToRows(node, config, upCols);
+                return columnsToRowsOutputs(upCols, config);
+            }
+            case "rows_to_columns": {
+                DagNode up = dag.firstUpstream(node.id());
+                List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                        : outputColumns(up, dag, flowId, missing, depth + 1);
+                RowsToColumnsConfig config = parseRowsToColumns(node);
+                validateRowsToColumns(node, config, upCols);
+                return rowsToColumnsOutputs(upCols, config);
+            }
             default:
                 return new ArrayList<>();
         }
@@ -1636,11 +2667,12 @@ public class SqlBuilderFactory {
         if (fields == null) {
             return result;
         }
+        Long dataSourceId = node.longValue("dataSourceId");
         for (JsonNode f : fields) {
             String name = f.path("name").asText("");
             String type = f.path("type").asText("STRING");
             if (!name.isEmpty()) {
-                result.add(new OutputColumn(name, type));
+                result.add(new OutputColumn(name, dorisType(dataSourceId, type)));
             }
         }
         return result;

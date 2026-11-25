@@ -9,11 +9,13 @@ import com.datamodel.dto.TableInfo;
 import com.datamodel.dto.TestConnectionResult;
 import com.datamodel.service.connector.ConnectionErrorClassifier;
 import com.datamodel.service.connector.JdbcConnector;
+import com.datamodel.service.doris.TypeMappingRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.sql.Connection;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -27,15 +29,18 @@ public class DataSourceInspectService {
     private final AesGcmCipher aesGcmCipher;
     private final JdbcConnector jdbcConnector;
     private final SchemaCacheService schemaCacheService;
+    private final TypeMappingRegistry typeMappingRegistry;
 
     public DataSourceInspectService(DataSourceService dataSourceService,
                                     AesGcmCipher aesGcmCipher,
                                     JdbcConnector jdbcConnector,
-                                    SchemaCacheService schemaCacheService) {
+                                    SchemaCacheService schemaCacheService,
+                                    TypeMappingRegistry typeMappingRegistry) {
         this.dataSourceService = dataSourceService;
         this.aesGcmCipher = aesGcmCipher;
         this.jdbcConnector = jdbcConnector;
         this.schemaCacheService = schemaCacheService;
+        this.typeMappingRegistry = typeMappingRegistry;
     }
 
     public TestConnectionResult test(Long id) {
@@ -60,21 +65,32 @@ public class DataSourceInspectService {
 
     public List<ColumnInfo> listColumns(Long id, String table) {
         String safeTable = jdbcConnector.validateTableName(table);
+        DataSourceEntity entity = dataSourceService.getEntity(id);
         List<ColumnInfo> cached = schemaCacheService.get(id, safeTable);
         if (cached != null) {
-            return cached;
+            return normalizeColumns(entity, cached);
         }
-        DataSourceEntity entity = dataSourceService.getEntity(id);
         String password = aesGcmCipher.decrypt(entity.getPasswordEnc());
         try (Connection connection = jdbcConnector.openConnection(entity, password)) {
             List<ColumnInfo> columns = jdbcConnector.listColumns(connection, entity, safeTable);
+            // 缓存保留源库原始类型，归一化只在响应层做，避免方言信息丢失。
             schemaCacheService.put(id, entity.getDefaultDb(), safeTable, columns);
-            return columns;
+            return normalizeColumns(entity, columns);
         } catch (BizException e) {
             throw e;
         } catch (Exception e) {
             throw connectionFailure(entity, e);
         }
+    }
+
+    private List<ColumnInfo> normalizeColumns(DataSourceEntity entity, List<ColumnInfo> columns) {
+        List<ColumnInfo> result = new ArrayList<>(columns.size());
+        for (ColumnInfo column : columns) {
+            String raw = column.getSourceType() != null ? column.getSourceType() : column.getType();
+            String doris = typeMappingRegistry.normalize(entity.getType(), raw).getDorisType();
+            result.add(new ColumnInfo(column.getName(), doris, raw));
+        }
+        return result;
     }
 
     private BizException connectionFailure(DataSourceEntity entity, Exception e) {

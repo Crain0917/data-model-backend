@@ -22,6 +22,35 @@ public class TypeMappingRegistry {
     ));
 
     /**
+     * 已经是 Doris 合法类型名的基类型。命中时直接按 Doris 规则归一（幂等），
+     * 避免把 LARGEINT / DATETIMEV2 之类再按 MySQL 规则映射成 STRING。
+     */
+    private static final java.util.Set<String> DORIS_NATIVE_BASES = new java.util.HashSet<>(java.util.Arrays.asList(
+            "BOOLEAN", "TINYINT", "SMALLINT", "INT", "BIGINT", "LARGEINT", "FLOAT", "DOUBLE",
+            "DECIMAL", "CHAR", "VARCHAR", "STRING", "DATE", "DATETIME", "DATETIMEV2", "DATEV2",
+            "JSON", "ARRAY", "MAP", "STRUCT", "VARIANT", "HLL", "BITMAP", "IPV4", "IPV6"
+    ));
+
+    /**
+     * 按数据源方言归一化字段类型：源库原始类型（bigint unsigned / VARCHAR2 / NUMBER(10,2)）
+     * 走 dialect 映射；已是 Doris 类型的值保持幂等，不会二次降级。
+     */
+    public TypeMapping normalize(String dialect, String rawType) {
+        if (rawType == null || rawType.trim().isEmpty()) {
+            return TypeMapping.fallback("STRING", "字段类型为空，已按 STRING 兜底");
+        }
+        Parsed p = Parsed.of(rawType);
+        if (!p.unsigned && DORIS_NATIVE_BASES.contains(p.base)) {
+            return normalizeDorisType(rawType);
+        }
+        String d = dialect == null ? null : dialect.trim().toUpperCase(Locale.ROOT);
+        if (d == null || d.isEmpty() || DORIS.equals(d)) {
+            return normalizeDorisType(rawType);
+        }
+        return map(d, rawType);
+    }
+
+    /**
      * 中间表 / DDL 用类型归一化，幂等：输入源库原始类型（{@code bigint unsigned}、{@code datetime(3)}）
      * 或已是 Doris 类型（{@code LARGEINT}、{@code DATETIMEV2(3)}）都归一为合法 Doris 类型。
      * 无符号整型必须加宽，DDL 中不得出现 UNSIGNED。

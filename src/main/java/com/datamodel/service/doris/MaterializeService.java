@@ -61,15 +61,27 @@ public class MaterializeService {
             throw new BizException(ErrorCode.DAG_INVALID, "节点配置不完整，无法确定输出字段",
                     java.util.Collections.singletonMap("nodeId", node.id()));
         }
+        String target = nameSanitizer.middleTable(flowId, node.id());
+        return materializeQuery(flowId, node.id(), target, columns,
+                built.getSql(), built.getDisplaySql(), built.getParams());
+    }
+
+    /**
+     * 把任意 SELECT（可含 WITH）物化到指定中间表：行去重重复行流复用它，
+     * 与节点主输出共用建表 / 指纹 / INSERT OVERWRITE 逻辑。
+     */
+    public MaterializeResult materializeQuery(long flowId, String nodeId, String target,
+                                              List<OutputColumn> columns,
+                                              String sql, String displaySql,
+                                              List<Object> params) {
         List<DdlColumn> ddlColumns = normalize(columns);
         String fingerprint = fingerprint(ddlColumns);
-        String target = nameSanitizer.middleTable(flowId, node.id());
 
         boolean recreated = prepareTarget(target, fingerprint, ddlColumns);
 
-        String insertSelect = buildInsert(target, built.getSql());
-        String displayInsert = buildInsert(target, built.getDisplaySql());
-        execute(insertSelect, displayInsert, built.getParams());
+        String insertSelect = buildInsert(target, sql);
+        String displayInsert = buildInsert(target, displaySql);
+        execute(insertSelect, displayInsert, params);
 
         long rows = dorisClient.tableRowCount(target);
 
@@ -77,7 +89,7 @@ public class MaterializeService {
         registry.setDorisTable(target);
         registry.setKind("MID");
         registry.setFlowId(flowId);
-        registry.setNodeId(node.id());
+        registry.setNodeId(nodeId);
         registry.setSchemaFingerprint(fingerprint);
         registry.setKeyCols("[\"__dm_rowid\"]");
         registry.setRowCount(rows);
@@ -90,7 +102,7 @@ public class MaterializeService {
         result.setRows(rows);
         result.setSql(displayInsert);
         result.setRecreated(recreated);
-        log.info("中间表物化完成 flow={} node={} -> {} 行数={}", flowId, node.id(), target, rows);
+        log.info("中间表物化完成 flow={} node={} -> {} 行数={}", flowId, nodeId, target, rows);
         return result;
     }
 
@@ -138,10 +150,72 @@ public class MaterializeService {
         }
     }
 
+    /**
+     * CTE 必须提升到 INSERT 之外，否则会被塞进派生表 {@code FROM ( WITH ... SELECT ... )}，
+     * Doris 不支持派生表内出现 WITH。
+     */
     private String buildInsert(String target, String select) {
-        return "INSERT OVERWRITE TABLE " + dorisClient.qualifiedQuoted(target)
-                + "\nSELECT row_number() OVER () AS `__dm_rowid`, src.* FROM (\n"
+        String header = "INSERT OVERWRITE TABLE " + dorisClient.qualifiedQuoted(target) + "\n";
+        String trimmed = select.trim();
+        int mainSelect = mainSelectAfterCte(trimmed);
+        if (mainSelect > 0) {
+            String cte = trimmed.substring(0, mainSelect).trim();
+            String body = trimmed.substring(mainSelect);
+            return header + cte + "\nSELECT row_number() OVER () AS `__dm_rowid`, src.* FROM (\n"
+                    + body + "\n) src";
+        }
+        return header + "SELECT row_number() OVER () AS `__dm_rowid`, src.* FROM (\n"
                 + select + "\n) src";
+    }
+
+    /** 返回 WITH 子句之后顶层 SELECT 的起始下标；不是 WITH 开头时返回 -1。 */
+    private static int mainSelectAfterCte(String sql) {
+        if (!sql.regionMatches(true, 0, "WITH ", 0, 5)) {
+            return -1;
+        }
+        int depth = 0;
+        boolean inString = false;
+        boolean inBacktick = false;
+        int n = sql.length();
+        for (int i = 4; i < n; i++) {
+            char c = sql.charAt(i);
+            if (inString) {
+                if (c == '\'') {
+                    if (i + 1 < n && sql.charAt(i + 1) == '\'') {
+                        i++;
+                    } else {
+                        inString = false;
+                    }
+                }
+                continue;
+            }
+            if (inBacktick) {
+                if (c == '`') {
+                    inBacktick = false;
+                }
+                continue;
+            }
+            if (c == '\'') {
+                inString = true;
+            } else if (c == '`') {
+                inBacktick = true;
+            } else if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                depth--;
+            } else if (depth == 0 && Character.isWhitespace(c)) {
+                int j = i;
+                while (j < n && Character.isWhitespace(sql.charAt(j))) {
+                    j++;
+                }
+                if (sql.regionMatches(true, j, "SELECT", 0, 6)
+                        && (j + 6 >= n || !Character.isLetterOrDigit(sql.charAt(j + 6)))) {
+                    return j;
+                }
+                i = j - 1;
+            }
+        }
+        return -1;
     }
 
     private List<DdlColumn> normalize(List<OutputColumn> columns) {

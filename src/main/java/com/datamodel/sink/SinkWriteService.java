@@ -125,13 +125,71 @@ public class SinkWriteService {
         progress.getParams().putAll(result.getParams());
 
         if (config.isDoris()) {
-            writeDoris(flowId, runId, node, config, upstreamTable, watermarkType, logSink, result,
+            writeDoris(flowId, runId, node.id(), config, upstreamTable, watermarkType, logSink,
+                    result, progress);
+        } else {
+            writeJdbc(flowId, runId, node.id(), config, upstreamTable, watermarkType, logSink,
+                    result, progress);
+        }
+        return result;
+    }
+
+    /**
+     * 按指定已物化源表写目标：行去重的重复行流复用完整的目标检查/建表/批次/重试逻辑。
+     * 调用方负责把重复行物化成 Doris 中间表并传来输出列。
+     */
+    public SinkWriteResult writeTable(long flowId, long runId, String nodeId, String upstreamTable,
+                                      List<OutputColumn> outputColumns, SinkConfig config,
+                                      LogSink logSink, SinkProgress progress) {
+        List<ColumnInfo> physical = materializedColumns(nodeId, upstreamTable);
+        Set<String> physicalNames = new LinkedHashSet<>();
+        for (ColumnInfo column : physical) {
+            if (!SinkSqlPlanner.isHidden(column.getName())) {
+                physicalNames.add(column.getName());
+            }
+        }
+        config = configParser.resolve(config, outputColumns);
+        configParser.validateAgainstPhysicalColumns(config, physicalNames);
+
+        String watermarkType = typeOf(physical, config.getWatermarkColumn());
+        if (config.isOverwrite()) {
+            watermarkRepository.deleteNodeTarget(flowId, nodeId, config.targetKey());
+        }
+        SinkWriteResult result = new SinkWriteResult();
+        result.setTargetType(config.getTargetType());
+        result.setTargetTable(config.getTableName());
+        result.setWriteMode(config.getWriteMode());
+        fillParams(result, config, upstreamTable);
+        progress.setTargetType(config.getTargetType());
+        progress.setTargetTable(config.getTableName());
+        progress.setWriteMode(config.getWriteMode());
+        progress.setWatermarkColumn(config.getWatermarkColumn());
+        progress.getParams().putAll(result.getParams());
+
+        if (config.isDoris()) {
+            writeDoris(flowId, runId, nodeId, config, upstreamTable, watermarkType, logSink, result,
                     progress);
         } else {
-            writeJdbc(flowId, runId, node, config, upstreamTable, watermarkType, logSink, result,
+            writeJdbc(flowId, runId, nodeId, config, upstreamTable, watermarkType, logSink, result,
                     progress);
         }
         return result;
+    }
+
+    /** 重复行中间表（已物化）的物理列检查，错误语义与普通上游一致。 */
+    private List<ColumnInfo> materializedColumns(String nodeId, String table) {
+        if (!dorisClient.tableExists(table)) {
+            throw new BizException(ErrorCode.NODE_NOT_MATERIALIZED,
+                    "重复行中间表尚未物化：" + table,
+                    java.util.Collections.singletonMap("nodeId", nodeId));
+        }
+        List<ColumnInfo> physical = dorisClient.listColumns(table);
+        if (physical.isEmpty()) {
+            throw new BizException(ErrorCode.NODE_NOT_MATERIALIZED,
+                    "重复行中间表尚未物化：" + table,
+                    java.util.Collections.singletonMap("nodeId", nodeId));
+        }
+        return physical;
     }
 
     /** reuseUpstream 同步预检：只读已物化的上游表，不再重算祖先（D-M3.7-06）。 */
@@ -163,7 +221,7 @@ public class SinkWriteService {
 
     // ----------------------------------------------------------------- Doris
 
-    private void writeDoris(long flowId, long runId, DagNode node,
+    private void writeDoris(long flowId, long runId, String nodeId,
                             SinkConfig config, String upstreamTable, String watermarkType,
                             LogSink logSink, SinkWriteResult result, SinkProgress progress) {
         DataSourceEntity ds = targetDataSource(config);
@@ -187,7 +245,7 @@ public class SinkWriteService {
             throw dorisTargetFailure(target, "目标检查/建表", e);
         }
 
-        SinkWatermarkEntity watermark = loadWatermark(flowId, node.id(), config);
+        SinkWatermarkEntity watermark = loadWatermark(flowId, nodeId, config);
         initWatermarkProgress(progress, watermark);
         boolean resume = canResume(config, watermark);
         SinkSqlPlanner.SinkReadPlan plan = SinkSqlPlanner.plan(upstreamTable, config);
@@ -195,7 +253,7 @@ public class SinkWriteService {
             plan = planWithoutWatermark(config, upstreamTable);
         }
         progress.setSqlText("Stream Load → " + config.targetLabel());
-        writeDorisRows(flowId, runId, node, config, target, plan, resume, watermark,
+        writeDorisRows(flowId, runId, nodeId, config, target, plan, resume, watermark,
                 watermarkType, targetColumns, logSink, result, progress);
         result.setSqlText("Stream Load → " + config.targetLabel());
     }
@@ -212,7 +270,7 @@ public class SinkWriteService {
         return cause;
     }
 
-    private void writeDorisRows(long flowId, long runId, DagNode node, SinkConfig config,
+    private void writeDorisRows(long flowId, long runId, String nodeId, SinkConfig config,
                                 DorisClient.DorisEndpoint target,
                                 SinkSqlPlanner.SinkReadPlan plan, boolean resume,
                                 SinkWatermarkEntity watermark, String watermarkType,
@@ -235,7 +293,7 @@ public class SinkWriteService {
         int batchNo = 0;
         List<Object[]> batch = new ArrayList<>();
         long seq = committed;
-        String labelPrefix = labelPrefix(runId, node.id());
+        String labelPrefix = labelPrefix(runId, nodeId);
 
         try (Connection connection = dorisClient.open();
              PreparedStatement ps = connection.prepareStatement(plan.getSql(),
@@ -263,7 +321,7 @@ public class SinkWriteService {
                         committed += written;
                         seq += written;
                         batches++;
-                        advanceWatermark(flowId, node, config, watermark,
+                        advanceWatermark(flowId, nodeId, config, watermark,
                                 last, rowidIndex, watermarkIndex, watermarkType, committed, logSink,
                                 progress);
                         progress.setRowsWritten(rows);
@@ -287,7 +345,7 @@ public class SinkWriteService {
                     committed += written;
                     seq += written;
                     batches++;
-                    advanceWatermark(flowId, node, config, watermark,
+                    advanceWatermark(flowId, nodeId, config, watermark,
                             last, rowidIndex, watermarkIndex, watermarkType, committed, logSink,
                             progress);
                     progress.setRowsWritten(rows);
@@ -397,7 +455,7 @@ public class SinkWriteService {
 
     // ------------------------------------------------------------------ JDBC
 
-    private void writeJdbc(long flowId, long runId, DagNode node,
+    private void writeJdbc(long flowId, long runId, String nodeId,
                            SinkConfig config, String upstreamTable, String watermarkType,
                            LogSink logSink, SinkWriteResult result, SinkProgress progress) {
         DataSourceEntity ds = targetDataSource(config);
@@ -423,7 +481,7 @@ public class SinkWriteService {
                 logSink.log("INFO", "覆盖写入：已清空目标表 " + config.getTableName());
             }
 
-            SinkWatermarkEntity watermark = loadWatermark(flowId, node.id(), config);
+            SinkWatermarkEntity watermark = loadWatermark(flowId, nodeId, config);
             initWatermarkProgress(progress, watermark);
             boolean resume = canResume(config, watermark);
             SinkSqlPlanner.SinkReadPlan plan = resume
@@ -432,7 +490,7 @@ public class SinkWriteService {
             String sqlText = "INSERT INTO " + config.getTableName() + "("
                     + config.getFieldMapping().size() + " cols) 批插 → " + config.targetLabel();
             progress.setSqlText(sqlText);
-            writeJdbcRows(target, flowId, runId, node, config, ds, plan, resume, watermark,
+            writeJdbcRows(target, flowId, runId, nodeId, config, ds, plan, resume, watermark,
                     watermarkType, logSink, result, progress);
             result.setSqlText(sqlText);
         } catch (SQLException e) {
@@ -445,7 +503,8 @@ public class SinkWriteService {
         }
     }
 
-    private void writeJdbcRows(Connection target, long flowId, long runId, DagNode node, SinkConfig config,
+    private void writeJdbcRows(Connection target, long flowId, long runId, String nodeId,
+                               SinkConfig config,
                                DataSourceEntity ds, SinkSqlPlanner.SinkReadPlan plan,
                                boolean resume, SinkWatermarkEntity watermark,
                                String watermarkType, LogSink logSink, SinkWriteResult result,
@@ -485,7 +544,7 @@ public class SinkWriteService {
                         rows += batch.size();
                         committed += batch.size();
                         batches++;
-                        advanceWatermark(flowId, node, config, watermark,
+                        advanceWatermark(flowId, nodeId, config, watermark,
                                 last, rowidIndex, watermarkIndex, watermarkType, committed, logSink,
                                 progress);
                         progress.setRowsWritten(rows);
@@ -507,7 +566,7 @@ public class SinkWriteService {
                     rows += size;
                     committed += size;
                     batches++;
-                    advanceWatermark(flowId, node, config, watermark,
+                    advanceWatermark(flowId, nodeId, config, watermark,
                             last, rowidIndex, watermarkIndex, watermarkType, committed, logSink,
                             progress);
                     progress.setRowsWritten(rows);
@@ -769,7 +828,7 @@ public class SinkWriteService {
         return copy;
     }
 
-    private void advanceWatermark(long flowId, DagNode node, SinkConfig config,
+    private void advanceWatermark(long flowId, String nodeId, SinkConfig config,
                                   SinkWatermarkEntity existing, Object[] lastRow,
                                   int rowidIndex, int watermarkIndex, String watermarkType,
                                   long committed, LogSink logSink, SinkProgress progress) {
@@ -785,7 +844,7 @@ public class SinkWriteService {
         }
         SinkWatermarkEntity entity = new SinkWatermarkEntity();
         entity.setFlowId(flowId);
-        entity.setNodeId(node.id());
+        entity.setNodeId(nodeId);
         entity.setTargetKey(config.targetKey());
         entity.setWatermarkColumn(config.getWatermarkColumn());
         entity.setLastValue(stringValue(value));
