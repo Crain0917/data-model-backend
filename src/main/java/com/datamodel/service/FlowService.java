@@ -27,6 +27,7 @@ import com.datamodel.mapper.TableRegistryMapper;
 import com.datamodel.service.doris.DorisClient;
 import com.datamodel.service.doris.DorisNameSanitizer;
 import com.datamodel.service.doris.SinkWatermarkRepository;
+import com.datamodel.service.llm.LlmCredentialService;
 import com.datamodel.sink.SinkConfig;
 import com.datamodel.sink.SinkConfigParser;
 import com.datamodel.sink.SinkField;
@@ -72,6 +73,7 @@ public class FlowService {
     private final SinkWatermarkRepository sinkWatermarkRepository;
     private final DataSourceService dataSourceService;
     private final SqlBuilderFactory sqlBuilderFactory;
+    private final LlmCredentialService llmCredentialService;
 
     public FlowService(FlowMapper flowMapper, FlowRunMapper flowRunMapper,
                        NodeRunMapper nodeRunMapper, RunLogMapper runLogMapper,
@@ -81,7 +83,8 @@ public class FlowService {
                        SinkConfigParser sinkConfigParser,
                        SinkWatermarkRepository sinkWatermarkRepository,
                        DataSourceService dataSourceService,
-                       SqlBuilderFactory sqlBuilderFactory) {
+                       SqlBuilderFactory sqlBuilderFactory,
+                       LlmCredentialService llmCredentialService) {
         this.flowMapper = flowMapper;
         this.flowRunMapper = flowRunMapper;
         this.nodeRunMapper = nodeRunMapper;
@@ -96,6 +99,7 @@ public class FlowService {
         this.sinkWatermarkRepository = sinkWatermarkRepository;
         this.dataSourceService = dataSourceService;
         this.sqlBuilderFactory = sqlBuilderFactory;
+        this.llmCredentialService = llmCredentialService;
     }
 
     public PageResult<FlowVO> list(String keyword, Integer page, Integer size) {
@@ -189,6 +193,7 @@ public class FlowService {
             throw new BizException(ErrorCode.PARAM_ERROR, "dagJson 不能为空");
         }
         FlowValidation.validate(dagJson);
+        FlowValidation.validateSaveConfig(dagJson);
         validateSinkConfigs(id, dagJson);
         JsonNode nodes = dagJson.get("nodes");
         entity.setDagJson(dagJson.toString());
@@ -197,6 +202,7 @@ public class FlowService {
         flowMapper.updateById(entity);
         log.info("保存画布 flow={} nodes={}", id, entity.getNodeCount());
         reconcileMiddleTables(id, dagJson);
+        llmCredentialService.reconcile(id, dagJson);
     }
 
     /**
@@ -478,6 +484,11 @@ public class FlowService {
                 }
             }
         }
+        try {
+            tables.addAll(dorisClient.listTablesWithPrefix(nameSanitizer.llmTablePrefix(flowId)));
+        } catch (RuntimeException e) {
+            log.warn("读取大模型临时表清单失败 flow={}：{}", flowId, e.getMessage());
+        }
         return tables;
     }
 
@@ -556,6 +567,7 @@ public class FlowService {
         } catch (RuntimeException e) {
             log.warn("清理 node_field 失败 flow={}：{}", flowId, e.getMessage());
         }
+        llmCredentialService.deleteFlow(flowId);
         List<Long> runIds = new ArrayList<>();
         try {
             for (FlowRunEntity run : flowRunMapper.selectList(

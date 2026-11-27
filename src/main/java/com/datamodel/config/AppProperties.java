@@ -9,6 +9,7 @@ public class AppProperties {
     private final SchemaCache schemaCache = new SchemaCache();
     private final DataSourceOptions dataSource = new DataSourceOptions();
     private final Cors cors = new Cors();
+    private final Llm llm = new Llm();
 
     public Security getSecurity() {
         return security;
@@ -24,6 +25,10 @@ public class AppProperties {
 
     public Cors getCors() {
         return cors;
+    }
+
+    public Llm getLlm() {
+        return llm;
     }
 
     public static class Security {
@@ -82,6 +87,69 @@ public class AppProperties {
 
         public void setPreviewQueryTimeoutSeconds(int previewQueryTimeoutSeconds) {
             this.previewQueryTimeoutSeconds = previewQueryTimeoutSeconds;
+        }
+    }
+
+    public static class Llm {
+        /** 是否允许调用私网 endpoint（默认仅公网 https）。 */
+        private boolean allowPrivateEndpoints = false;
+        /** 允许的 host[:port] 白名单，逗号分隔；allowPrivateEndpoints=true 时命中才放行。 */
+        private String allowedHosts = "";
+        /** 单次请求输入 JSON 字符数上限，超过自动对半拆批。 */
+        private int maxInputChars = 24000;
+        /** 失败临时表保留小时数（排查用）。 */
+        private int tempTableRetainHours = 24;
+        /** 数据预览最多真实调用的行数。 */
+        private int previewMaxRows = 20;
+        /** 数据预览超时（秒），预览不重试。 */
+        private int previewTimeoutSeconds = 30;
+
+        public boolean isAllowPrivateEndpoints() {
+            return allowPrivateEndpoints;
+        }
+
+        public void setAllowPrivateEndpoints(boolean allowPrivateEndpoints) {
+            this.allowPrivateEndpoints = allowPrivateEndpoints;
+        }
+
+        public String getAllowedHosts() {
+            return allowedHosts;
+        }
+
+        public void setAllowedHosts(String allowedHosts) {
+            this.allowedHosts = allowedHosts;
+        }
+
+        public int getMaxInputChars() {
+            return maxInputChars;
+        }
+
+        public void setMaxInputChars(int maxInputChars) {
+            this.maxInputChars = maxInputChars;
+        }
+
+        public int getTempTableRetainHours() {
+            return tempTableRetainHours;
+        }
+
+        public void setTempTableRetainHours(int tempTableRetainHours) {
+            this.tempTableRetainHours = tempTableRetainHours;
+        }
+
+        public int getPreviewMaxRows() {
+            return previewMaxRows;
+        }
+
+        public void setPreviewMaxRows(int previewMaxRows) {
+            this.previewMaxRows = previewMaxRows;
+        }
+
+        public int getPreviewTimeoutSeconds() {
+            return previewTimeoutSeconds;
+        }
+
+        public void setPreviewTimeoutSeconds(int previewTimeoutSeconds) {
+            this.previewTimeoutSeconds = previewTimeoutSeconds;
         }
     }
 

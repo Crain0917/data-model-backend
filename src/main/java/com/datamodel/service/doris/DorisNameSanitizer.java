@@ -63,6 +63,16 @@ public class DorisNameSanitizer {
         return "dm_src_" + flowId + "_";
     }
 
+    /** 大模型节点的 id→结果映射临时表：dm_llm_{flowId}_{nodeId}__map。 */
+    public String llmMapTable(long flowId, String nodeId) {
+        return fit("dm_llm_" + flowId + "_" + sanitizePart(nodeId) + "__map");
+    }
+
+    /** 某任务全部大模型临时表的公共前缀（用于删除任务时清理）。 */
+    public String llmTablePrefix(long flowId) {
+        return "dm_llm_" + flowId + "_";
+    }
+
     /** 清洗任意片段：小写、非 [a-z0-9_] 变 _、折叠下划线、去首尾下划线。 */
     public String sanitizePart(String raw) {
         if (raw == null) {

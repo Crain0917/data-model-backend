@@ -1395,7 +1395,7 @@ class SqlBuilderFactoryTest {
     // --------------------------------------------------- ColumnsToRows
 
     @Test
-    void columnsToRowsBuildsUnionAllAndOutputs() throws Exception {
+    void columnsToRowsBuildsAlignedUnnestArrays() throws Exception {
         SqlBuildResult result = factory.build(opsDag("columns_to_rows", "p1", "{"
                 + "\"alias\":\"a\",\"keepFields\":[\"uid\",\"city\"],"
                 + "\"valueFields\":[{\"field\":\"amount\",\"label\":\"AMT\"},"
@@ -1403,11 +1403,15 @@ class SqlBuilderFactoryTest {
                 + "\"nameOutput\":\"metric\",\"valueOutput\":\"val\","
                 + "\"valueType\":\"STRING\",\"skipNull\":true}"), 101L, "p1");
         String sql = result.getSql();
-        assertTrue(sql.contains("SELECT\n  `a`.`uid`,\n  `a`.`city`,\n  'AMT' AS `metric`,\n"
-                + "  CAST(`a`.`amount` AS STRING) AS `val`\nFROM "), sql);
-        assertTrue(sql.contains("WHERE `a`.`amount` IS NOT NULL"), sql);
-        assertTrue(sql.contains("UNION ALL"), sql);
-        assertTrue(sql.contains("'UID' AS `metric`"), sql);
+        assertTrue(sql.contains("SELECT\n  `a`.`uid`,\n  `a`.`city`,\n"
+                + "  `dm_u`.tag AS `metric`,\n"
+                + "  CAST(`dm_u`.val AS STRING) AS `val`\nFROM "), sql);
+        assertTrue(sql.contains("LEFT JOIN UNNEST(\n"
+                + "  ARRAY('AMT', 'UID'),\n"
+                + "  ARRAY(CAST(`a`.`amount` AS STRING), CAST(`a`.`uid` AS STRING))\n"
+                + ") AS `dm_u`(tag, val) ON TRUE"), sql);
+        assertTrue(sql.contains("WHERE `dm_u`.val IS NOT NULL"), sql);
+        assertFalse(sql.contains("UNION ALL"), sql);
 
         assertEquals(4, result.getOutputColumns().size());
         assertEquals("uid", result.getOutputColumns().get(0).getName());
@@ -1419,13 +1423,15 @@ class SqlBuilderFactoryTest {
     }
 
     @Test
-    void columnsToRowsSupportsEmptyKeepAndDoubleValues() throws Exception {
+    void columnsToRowsKeepsNullRowsWhenSkipNullOff() throws Exception {
         SqlBuildResult result = factory.build(opsDag("columns_to_rows", "p1", "{"
                 + "\"alias\":\"a\",\"keepFields\":[],"
                 + "\"valueFields\":[{\"field\":\"amount\",\"label\":\"A\"}],"
+                + "\"nameOutput\":\"field_name\",\"valueOutput\":\"field_value\","
                 + "\"valueType\":\"DOUBLE\"}"), 101L, "p1");
-        assertTrue(result.getSql().contains("CAST(`a`.`amount` AS DOUBLE) AS `field_value`"),
+        assertTrue(result.getSql().contains("CAST(`dm_u`.val AS DOUBLE) AS `field_value`"),
                 result.getSql());
+        assertFalse(result.getSql().contains("WHERE"), result.getSql());
         assertEquals(2, result.getOutputColumns().size());
         assertEquals("field_name", result.getOutputColumns().get(0).getName());
         assertEquals("field_value", result.getOutputColumns().get(1).getName());
@@ -1433,13 +1439,35 @@ class SqlBuilderFactoryTest {
     }
 
     @Test
+    void columnsToRowsRejectsEmptyOutputNames() throws Exception {
+        String[][] cases = {
+                {"{\"alias\":\"a\",\"valueFields\":[{\"field\":\"city\"}],"
+                        + "\"valueOutput\":\"val\"}", "名称列名不能为空"},
+                {"{\"alias\":\"a\",\"valueFields\":[{\"field\":\"city\"}],"
+                        + "\"nameOutput\":\"metric\"}", "值列名不能为空"},
+                {"{\"alias\":\"a\",\"valueFields\":[{\"field\":\"city\"}],"
+                        + "\"nameOutput\":\" \",\"valueOutput\":\"val\"}", "名称列名不能为空"},
+        };
+        for (String[] c : cases) {
+            BizException e = assertThrows(BizException.class,
+                    () -> factory.build(opsDag("columns_to_rows", "p1", c[0]), 101L, "p1"),
+                    c[0]);
+            assertEquals(4000, e.getErrorCode().getCode(), c[0]);
+            assertEquals("COLUMNS_TO_ROWS_OUTPUT_EMPTY", reason(e), c[0]);
+            assertTrue(e.getMessage().contains(c[1]), e.getMessage());
+        }
+    }
+
+    @Test
     void columnsToRowsRejectsInvalidConfigurations() throws Exception {
         String[][] cases = {
                 {"{\"alias\":\"a\",\"valueFields\":[]}",
                         "COLUMNS_TO_ROWS_VALUE_FIELDS_EMPTY"},
-                {"{\"alias\":\"a\",\"valueFields\":[{\"field\":\"nope\"}]}",
+                {"{\"alias\":\"a\",\"nameOutput\":\"metric\",\"valueOutput\":\"val\","
+                        + "\"valueFields\":[{\"field\":\"nope\"}]}",
                         "COLUMNS_TO_ROWS_FIELD_UNKNOWN"},
-                {"{\"alias\":\"a\",\"keepFields\":[\"nope\"],"
+                {"{\"alias\":\"a\",\"nameOutput\":\"metric\",\"valueOutput\":\"val\","
+                        + "\"keepFields\":[\"nope\"],"
                         + "\"valueFields\":[{\"field\":\"city\"}]}",
                         "COLUMNS_TO_ROWS_FIELD_UNKNOWN"},
                 {"{\"alias\":\"a\",\"valueFields\":[{\"field\":\"city\"}],"
@@ -1447,10 +1475,13 @@ class SqlBuilderFactoryTest {
                         "COLUMNS_TO_ROWS_OUTPUT_DUPLICATE"},
                 {"{\"alias\":\"a\",\"keepFields\":[\"city\"],"
                         + "\"valueFields\":[{\"field\":\"amount\"}],"
-                        + "\"nameOutput\":\"city\"}", "COLUMNS_TO_ROWS_OUTPUT_DUPLICATE"},
-                {"{\"alias\":\"a\",\"valueFields\":[{\"field\":\"amount\"}],"
+                        + "\"nameOutput\":\"city\",\"valueOutput\":\"val\"}",
+                        "COLUMNS_TO_ROWS_OUTPUT_DUPLICATE"},
+                {"{\"alias\":\"a\",\"nameOutput\":\"metric\",\"valueOutput\":\"val\","
+                        + "\"valueFields\":[{\"field\":\"amount\"}],"
                         + "\"valueType\":\"INT\"}", "COLUMNS_TO_ROWS_VALUE_TYPE_INVALID"},
-                {"{\"alias\":\"a\",\"valueFields\":[{\"field\":\"city\"}],"
+                {"{\"alias\":\"a\",\"nameOutput\":\"metric\",\"valueOutput\":\"val\","
+                        + "\"valueFields\":[{\"field\":\"city\"}],"
                         + "\"valueType\":\"DOUBLE\"}",
                         "COLUMNS_TO_ROWS_VALUE_TYPE_UNSUPPORTED"},
         };
@@ -1545,6 +1576,79 @@ class SqlBuilderFactoryTest {
             assertEquals(4000, e.getErrorCode().getCode(), c[0]);
             assertEquals(c[1], reason(e), c[0] + " -> " + e.getMessage());
         }
+    }
+
+    // ------------------------------------------------ ReplaceInString
+
+    @Test
+    void replaceInStringLiteralInPlaceKeepsNullAndEscapesText() throws Exception {
+        SqlBuildResult result = factory.build(opsDag("replace_in_string", "rs1", "{"
+                + "\"alias\":\"a\",\"field\":\"city\",\"output\":\"\","
+                + "\"search\":\"a.b\",\"replacement\":\"\"}"), 101L, "rs1");
+        String sql = result.getSql();
+        assertTrue(sql.contains("CASE WHEN `a`.`city` IS NULL THEN NULL ELSE REPLACE("
+                + "`a`.`city`, 'a.b', '') END"), sql);
+        assertTrue(sql.contains("AS `city`"), sql);
+        assertFalse(sql.contains("REGEXP_REPLACE"), sql);
+        assertEquals(6, result.getOutputColumns().size());
+        assertEquals("city", result.getOutputColumns().get(2).getName());
+        assertEquals("STRING", result.getOutputColumns().get(2).getDorisType());
+    }
+
+    @Test
+    void replaceInStringRegexNewColumnUsesBackreferences() throws Exception {
+        SqlBuildResult result = factory.build(opsDag("replace_in_string", "rs1", "{"
+                + "\"alias\":\"a\",\"field\":\"note\",\"output\":\"note2\","
+                + "\"search\":\"(\\\\d+)-(\\\\d+)\",\"replacement\":\"$2/$1\","
+                + "\"useRegex\":true}"), 101L, "rs1");
+        String sql = result.getSql();
+        assertTrue(sql.contains("REGEXP_REPLACE(`a`.`note`, '(\\\\d+)-(\\\\d+)', '\\\\2/\\\\1')"), sql);
+        assertEquals("\\2/\\1", SqlBuilderFactory.regexReplacement("$2/$1"));
+        assertEquals("\\1元", SqlBuilderFactory.regexReplacement("${1}元"));
+        assertEquals(7, result.getOutputColumns().size());
+        assertEquals("note", result.getOutputColumns().get(3).getName());
+        assertEquals("note2", result.getOutputColumns().get(6).getName());
+        assertEquals("STRING", result.getOutputColumns().get(6).getDorisType());
+    }
+
+    @Test
+    void replaceInStringEscapesQuoteBackslashPercentUnderscore() throws Exception {
+        SqlBuildResult result = factory.build(opsDag("replace_in_string", "rs1", "{"
+                + "\"alias\":\"a\",\"field\":\"tags\",\"output\":\"tags2\","
+                + "\"search\":\"it's\\\\path%_\",\"replacement\":\"x'y\\\\z\"}"), 101L, "rs1");
+        String sql = result.getSql();
+        assertTrue(sql.contains("'it''s\\\\path%_'"), sql);
+        assertTrue(sql.contains("'x''y\\\\z'"), sql);
+    }
+
+    @Test
+    void replaceInStringRejectsInvalidConfigurations() throws Exception {
+        String[][] cases = {
+                {"{\"alias\":\"a\",\"field\":\"\",\"search\":\"x\"}",
+                        "REPLACE_IN_STRING_FIELD_MISSING"},
+                {"{\"alias\":\"a\",\"field\":\"nope\",\"search\":\"x\"}",
+                        "REPLACE_IN_STRING_FIELD_UNKNOWN"},
+                {"{\"alias\":\"a\",\"field\":\"uid\",\"search\":\"x\"}",
+                        "REPLACE_IN_STRING_FIELD_NOT_STRING"},
+                {"{\"alias\":\"a\",\"field\":\"city\",\"search\":\"\"}",
+                        "REPLACE_IN_STRING_SEARCH_EMPTY"},
+                {"{\"alias\":\"a\",\"field\":\"city\",\"search\":\"(\",\"useRegex\":true}",
+                        "REPLACE_IN_STRING_REGEX_INVALID"},
+                {"{\"alias\":\"a\",\"field\":\"city\",\"output\":\"note\",\"search\":\"x\"}",
+                        "REPLACE_IN_STRING_OUTPUT_DUPLICATE"},
+        };
+        for (String[] c : cases) {
+            BizException e = assertThrows(BizException.class,
+                    () -> factory.build(opsDag("replace_in_string", "rs1", c[0]), 101L, "rs1"),
+                    c[0]);
+            assertEquals(4000, e.getErrorCode().getCode(), c[0]);
+            assertEquals(c[1], reason(e), c[0] + " -> " + e.getMessage());
+        }
+        BizException e = assertThrows(BizException.class, () -> factory.build(
+                opsDag("replace_in_string", "rs1",
+                        "{\"alias\":\"a\",\"field\":\"city\",\"search\":\"(\",\"useRegex\":true}"),
+                101L, "rs1"));
+        assertTrue(e.getMessage().contains("city"), e.getMessage());
     }
 
     // -------------------------------------------------- TypeNormalization

@@ -136,8 +136,12 @@ public class SqlBuilderFactory {
                 return buildUniqueRows(node, dag, flowId, missing);
             case "columns_to_rows":
                 return buildColumnsToRows(node, dag, flowId, missing);
+            case "replace_in_string":
+                return buildReplaceInString(node, dag, flowId, missing);
             case "rows_to_columns":
                 return buildRowsToColumns(node, dag, flowId, missing);
+            case "llm":
+                return buildLlm(node, dag, flowId, missing);
             case "sink":
                 return buildSink(node);
             default:
@@ -169,6 +173,51 @@ public class SqlBuilderFactory {
                         + "，将执行 " + how + "；预览不写入";
         r.setSql(sql);
         r.setDisplaySql(sql);
+        return r;
+    }
+
+    /**
+     * 大模型节点没有直接可执行的 SQL：返回「说明 + 注释草案」，
+     * 真实执行由大模型算子服务按 __dm_rowid 分批调用后物化。
+     */
+    private SqlBuildResult buildLlm(DagNode node, Dag dag, long flowId, Set<String> missing) {
+        DagNode up = dag.firstUpstream(node.id());
+        String upTable = up == null ? "<missing_upstream>" : tableOf(up, dag, flowId, missing);
+        if (up == null) {
+            missing.add(node.id() + ":no-upstream");
+        }
+        String endpoint = node.config().path("endpoint").asText("").trim();
+        String model = node.config().path("model").asText("").trim();
+        String output = node.config().path("outputField").asText("").trim();
+        List<String> inputFields = new ArrayList<>();
+        JsonNode inputs = node.config().get("inputFields");
+        if (inputs != null && inputs.isArray()) {
+            for (JsonNode input : inputs) {
+                String field = input.asText("").trim();
+                if (!field.isEmpty()) {
+                    inputFields.add(field);
+                }
+            }
+        }
+        String unknown = node.config().path("unknownValue").asText("未知");
+        String mapTable = nameSanitizer.llmMapTable(flowId, node.id());
+        StringBuilder sql = new StringBuilder();
+        sql.append("-- 大模型节点：通过调用模型生成新列，无可执行 SQL\n");
+        sql.append("-- endpoint=").append(endpoint.isEmpty() ? "<未配置>" : endpoint)
+                .append("，model=").append(model.isEmpty() ? "<未配置>" : model)
+                .append("，输入字段=").append(inputFields.isEmpty() ? "<未选择>" : String.join(", ", inputFields))
+                .append("，新字段=").append(output.isEmpty() ? "<未配置>" : output + " STRING")
+                .append('\n');
+        sql.append("-- 最终物化 SQL 形如（注释草案，不可执行）：\n");
+        sql.append("-- SELECT s.*, COALESCE(m.`dm_value`, '")
+                .append(unknown.replace("'", "''"))
+                .append("') AS `").append(output.isEmpty() ? "<新字段>" : output).append("`\n");
+        sql.append("-- FROM ").append(upTable).append(" s\n");
+        sql.append("-- LEFT JOIN ").append(mapTable)
+                .append(" m ON s.`__dm_rowid` = m.`dm_vid`");
+        SqlBuildResult r = new SqlBuildResult();
+        r.setSql(sql.toString());
+        r.setDisplaySql(sql.toString());
         return r;
     }
 
@@ -1992,7 +2041,7 @@ public class SqlBuilderFactory {
             for (JsonNode v : arr) {
                 if (v.isObject()) {
                     String field = v.path("field").asText("").trim();
-                    String label = v.path("label").asText("");
+                    String label = v.path("label").asText("").trim();
                     c.valueFields.add(new ValueFieldSpec(field, label.isEmpty() ? field : label));
                 } else {
                     String field = v.asText("").trim();
@@ -2000,10 +2049,9 @@ public class SqlBuilderFactory {
                 }
             }
         }
-        String nameOutput = node.text("nameOutput", "").trim();
-        String valueOutput = node.text("valueOutput", "").trim();
-        c.nameOutput = nameOutput.isEmpty() ? "field_name" : nameOutput;
-        c.valueOutput = valueOutput.isEmpty() ? "field_value" : valueOutput;
+        // 名称列/值列不再静默回填默认值：空值由校验阶段报错，默认值由前端 defaultConfig 提供。
+        c.nameOutput = node.text("nameOutput", "").trim();
+        c.valueOutput = node.text("valueOutput", "").trim();
         String valueType = node.text("valueType", "STRING").trim().toUpperCase(Locale.ROOT);
         c.valueType = valueType.isEmpty() ? "STRING" : valueType;
         c.skipNull = node.boolValue("skipNull", false);
@@ -2055,6 +2103,14 @@ public class SqlBuilderFactory {
                         "值类型为 " + c.valueType + " 时，字段 " + column.getName()
                                 + " 必须是数字类型");
             }
+        }
+        if (c.nameOutput.isEmpty()) {
+            throw paramError(node, "COLUMNS_TO_ROWS_OUTPUT_EMPTY",
+                    "名称列名不能为空");
+        }
+        if (c.valueOutput.isEmpty()) {
+            throw paramError(node, "COLUMNS_TO_ROWS_OUTPUT_EMPTY",
+                    "值列名不能为空");
         }
         String nameOutput = requireOutputName(node, c.nameOutput,
                 "COLUMNS_TO_ROWS_OUTPUT_INVALID", "列转行名称列");
@@ -2108,29 +2164,180 @@ public class SqlBuilderFactory {
         ColumnsToRowsConfig config = parseColumnsToRows(node);
         validateColumnsToRows(node, config, upCols);
 
-        List<String> branches = new ArrayList<>();
+        List<String> selects = new ArrayList<>();
+        for (OutputColumn keep : upCols) {
+            if (containsColumnName(config.keepFields, keep.getName())) {
+                selects.add(Identifiers.ref(alias, keep.getName(), q));
+            }
+        }
+        selects.add("`dm_u`.tag AS " + Identifiers.quote(config.nameOutput, q));
+        selects.add("CAST(`dm_u`.val AS " + config.valueType + ") AS "
+                + Identifiers.quote(config.valueOutput, q));
+
+        List<String> labels = new ArrayList<>();
+        List<String> values = new ArrayList<>();
         for (ValueFieldSpec spec : config.valueFields) {
             OutputColumn column = findColumn(upCols, spec.field);
-            List<String> selects = new ArrayList<>();
-            for (OutputColumn keep : upCols) {
-                if (containsColumnName(config.keepFields, keep.getName())) {
-                    selects.add(Identifiers.ref(alias, keep.getName(), q));
+            labels.add(stringLiteral(spec.label));
+            values.add("CAST(" + Identifiers.ref(alias, column.getName(), q) + " AS STRING)");
+        }
+        StringBuilder sql = new StringBuilder("SELECT\n  ")
+                .append(String.join(",\n  ", selects))
+                .append("\nFROM ").append(upTable).append(" AS ")
+                .append(Identifiers.quote(alias, q))
+                .append("\nLEFT JOIN UNNEST(\n  ARRAY(").append(String.join(", ", labels))
+                .append("),\n  ARRAY(").append(String.join(", ", values))
+                .append(")\n) AS `dm_u`(tag, val) ON TRUE");
+        if (config.skipNull) {
+            sql.append("\nWHERE `dm_u`.val IS NOT NULL");
+        }
+        SqlBuildResult r = new SqlBuildResult();
+        r.setSql(sql.toString());
+        r.setDisplaySql(sql.toString());
+        return r;
+    }
+
+    // ------------------------------------------------ replace in string
+
+    private static final class ReplaceInStringConfig {
+        String field;
+        String output;
+        String search;
+        String replacement;
+        boolean useRegex;
+    }
+
+    private ReplaceInStringConfig parseReplaceInString(DagNode node) {
+        ReplaceInStringConfig c = new ReplaceInStringConfig();
+        c.field = node.text("field", "").trim();
+        c.output = node.text("output", "").trim();
+        c.search = node.text("search", "");
+        c.replacement = node.text("replacement", "");
+        c.useRegex = node.boolValue("useRegex", false);
+        return c;
+    }
+
+    /** 输出为空或与输入字段同名（忽略大小写）即原地替换。 */
+    private static boolean replaceInPlace(ReplaceInStringConfig c, OutputColumn column) {
+        return c.output.isEmpty() || c.output.equalsIgnoreCase(column.getName());
+    }
+
+    private void validateReplaceInString(DagNode node, ReplaceInStringConfig c,
+                                         List<OutputColumn> upCols) {
+        if (upCols.isEmpty()) {
+            throw paramError(node, "REPLACE_IN_STRING_UPSTREAM_UNKNOWN",
+                    "替换字符串无法确定上游字段，请先配置上游节点并获取字段");
+        }
+        if (c.field.isEmpty()) {
+            throw paramError(node, "REPLACE_IN_STRING_FIELD_MISSING",
+                    "替换字符串的输入字段不能为空");
+        }
+        OutputColumn column = findColumn(upCols, c.field);
+        if (column == null) {
+            throw paramError(node, "REPLACE_IN_STRING_FIELD_UNKNOWN",
+                    "替换字符串引用了不存在的字段：" + c.field);
+        }
+        if (!isStringType(column.getDorisType())) {
+            throw paramError(node, "REPLACE_IN_STRING_FIELD_NOT_STRING",
+                    "替换字符串的输入字段必须是字符串类型：" + column.getName()
+                            + "（" + column.getDorisType() + "）");
+        }
+        if (c.search.isEmpty()) {
+            throw paramError(node, "REPLACE_IN_STRING_SEARCH_EMPTY",
+                    "替换字符串的查找内容不能为空");
+        }
+        if (c.useRegex) {
+            try {
+                java.util.regex.Pattern.compile(c.search);
+            } catch (java.util.regex.PatternSyntaxException e) {
+                throw paramError(node, "REPLACE_IN_STRING_REGEX_INVALID",
+                        "替换字符串的正则表达式不合法（字段 " + column.getName() + "）："
+                                + e.getDescription());
+            }
+        }
+        if (!replaceInPlace(c, column)) {
+            String out = requireOutputName(node, c.output,
+                    "REPLACE_IN_STRING_OUTPUT_INVALID", "替换字符串");
+            if (findColumn(upCols, out) != null) {
+                throw paramError(node, "REPLACE_IN_STRING_OUTPUT_DUPLICATE",
+                        "替换字符串输出字段与上游字段重名：" + out);
+            }
+        }
+    }
+
+    private static String replaceInStringExpression(ReplaceInStringConfig c, OutputColumn column,
+                                                    String alias, Identifiers.QuoteStyle q) {
+        String ref = Identifiers.ref(alias, column.getName(), q);
+        String function = c.useRegex ? "REGEXP_REPLACE" : "REPLACE";
+        String replacement = c.useRegex ? regexReplacement(c.replacement) : c.replacement;
+        return "CAST(CASE WHEN " + ref + " IS NULL THEN NULL ELSE " + function + "(" + ref
+                + ", " + escapedStringLiteral(c.search) + ", "
+                + escapedStringLiteral(replacement) + ") END AS STRING)";
+    }
+
+    /** 契约里用户按 $1 / ${1} 引用分组，Doris REGEXP_REPLACE 用 \1。 */
+    static String regexReplacement(String replacement) {
+        if (replacement == null || replacement.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(replacement.length());
+        int i = 0;
+        while (i < replacement.length()) {
+            char ch = replacement.charAt(i);
+            if (ch == '$' && i + 1 < replacement.length()) {
+                int j = i + 1;
+                boolean braced = replacement.charAt(j) == '{';
+                if (braced) {
+                    j++;
+                }
+                int digitStart = j;
+                while (j < replacement.length() && Character.isDigit(replacement.charAt(j))) {
+                    j++;
+                }
+                if (j > digitStart && (!braced || (j < replacement.length()
+                        && replacement.charAt(j) == '}'))) {
+                    String group = replacement.substring(digitStart, j);
+                    sb.append('\\').append(group);
+                    i = braced ? j + 1 : j;
+                    continue;
                 }
             }
-            selects.add(stringLiteral(spec.label) + " AS " + Identifiers.quote(config.nameOutput, q));
-            selects.add("CAST(" + Identifiers.ref(alias, column.getName(), q) + " AS "
-                    + config.valueType + ") AS " + Identifiers.quote(config.valueOutput, q));
-            StringBuilder branch = new StringBuilder("SELECT\n  ")
-                    .append(String.join(",\n  ", selects))
-                    .append("\nFROM ").append(upTable).append(" AS ")
-                    .append(Identifiers.quote(alias, q));
-            if (config.skipNull) {
-                branch.append("\nWHERE ").append(Identifiers.ref(alias, column.getName(), q))
-                        .append(" IS NOT NULL");
-            }
-            branches.add(branch.toString());
+            sb.append(ch);
+            i++;
         }
-        String sql = String.join("\nUNION ALL\n", branches);
+        return sb.toString();
+    }
+
+    private SqlBuildResult buildReplaceInString(DagNode node, Dag dag, long flowId,
+                                                Set<String> missing) {
+        DagNode up = dag.firstUpstream(node.id());
+        String upTable = up == null ? "<missing_upstream>" : tableOf(up, dag, flowId, missing);
+        if (up == null) {
+            missing.add(node.id() + ":no-upstream");
+        }
+        String alias = Identifiers.requireAlias(node.text("alias", "a"), "a");
+        Identifiers.QuoteStyle q = Identifiers.QuoteStyle.BACKTICK;
+        List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                : outputColumns(up, dag, flowId, missing, 0);
+        ReplaceInStringConfig config = parseReplaceInString(node);
+        validateReplaceInString(node, config, upCols);
+
+        OutputColumn column = findColumn(upCols, config.field);
+        boolean inPlace = replaceInPlace(config, column);
+        String expression = replaceInStringExpression(config, column, alias, q);
+        List<String> selects = new ArrayList<>();
+        for (OutputColumn c : upCols) {
+            if (inPlace && c.getName().equals(column.getName())) {
+                selects.add(expression + " AS " + Identifiers.quote(column.getName(), q));
+            } else {
+                selects.add(Identifiers.ref(alias, c.getName(), q));
+            }
+        }
+        if (!inPlace) {
+            selects.add(expression + " AS " + Identifiers.quote(config.output, q));
+        }
+        String sql = "SELECT\n  " + String.join(",\n  ", selects)
+                + "\nFROM " + upTable + " AS " + Identifiers.quote(alias, q);
         SqlBuildResult r = new SqlBuildResult();
         r.setSql(sql);
         r.setDisplaySql(sql);
@@ -2648,6 +2855,27 @@ public class SqlBuilderFactory {
                 validateColumnsToRows(node, config, upCols);
                 return columnsToRowsOutputs(upCols, config);
             }
+            case "replace_in_string": {
+                DagNode up = dag.firstUpstream(node.id());
+                List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                        : outputColumns(up, dag, flowId, missing, depth + 1);
+                ReplaceInStringConfig config = parseReplaceInString(node);
+                validateReplaceInString(node, config, upCols);
+                OutputColumn column = findColumn(upCols, config.field);
+                boolean inPlace = replaceInPlace(config, column);
+                List<OutputColumn> result = new ArrayList<>();
+                for (OutputColumn c : upCols) {
+                    if (inPlace && c.getName().equals(column.getName())) {
+                        result.add(new OutputColumn(column.getName(), "STRING"));
+                    } else {
+                        result.add(new OutputColumn(c.getName(), c.getDorisType()));
+                    }
+                }
+                if (!inPlace) {
+                    result.add(new OutputColumn(config.output, "STRING"));
+                }
+                return result;
+            }
             case "rows_to_columns": {
                 DagNode up = dag.firstUpstream(node.id());
                 List<OutputColumn> upCols = up == null ? new ArrayList<>()
@@ -2656,9 +2884,50 @@ public class SqlBuilderFactory {
                 validateRowsToColumns(node, config, upCols);
                 return rowsToColumnsOutputs(upCols, config);
             }
+            case "llm": {
+                DagNode up = dag.firstUpstream(node.id());
+                List<OutputColumn> upCols = up == null ? new ArrayList<>()
+                        : outputColumns(up, dag, flowId, missing, depth + 1);
+                return llmOutputColumns(upCols, node);
+            }
             default:
                 return new ArrayList<>();
         }
+    }
+
+    /** 大模型节点输出 = 上游逻辑列 + 新字段（STRING）；未配置时容忍，运行/预览期再校验。 */
+    private List<OutputColumn> llmOutputColumns(List<OutputColumn> upCols, DagNode node) {
+        List<OutputColumn> result = new ArrayList<>();
+        for (OutputColumn column : upCols) {
+            result.add(new OutputColumn(column.getName(), column.getDorisType()));
+        }
+        String output = node.config().path("outputField").asText("").trim();
+        if (!output.isEmpty() && findColumn(result, output) == null) {
+            result.add(new OutputColumn(output, "STRING"));
+        }
+        return result;
+    }
+
+    /** 指定节点的逻辑输出列（草稿 DAG，不要求已保存）。 */
+    public List<OutputColumn> nodeColumns(JsonNode dagJson, long flowId, String nodeId) {
+        Dag dag = Dag.parse(dagJson);
+        DagNode node = dag.node(nodeId);
+        if (node == null) {
+            return new ArrayList<>();
+        }
+        return outputColumns(node, dag, flowId, new LinkedHashSet<>(), 0);
+    }
+
+    /** 指定节点实际读取的物化表（source 返回源副本表）；无法确定时返回 null。 */
+    public String materializedTable(JsonNode dagJson, long flowId, String nodeId) {
+        Dag dag = Dag.parse(dagJson);
+        DagNode node = dag.node(nodeId);
+        if (node == null) {
+            return null;
+        }
+        Set<String> missing = new LinkedHashSet<>();
+        String table = tableOf(node, dag, flowId, missing);
+        return table == null || table.startsWith("<") ? null : table;
     }
 
     private List<OutputColumn> sourceColumns(DagNode node) {
@@ -2933,6 +3202,12 @@ public class SqlBuilderFactory {
 
     private static String stringLiteral(String value) {
         return "'" + value.replace("'", "''") + "'";
+    }
+
+    /** 用户自由文本（替换/查找内容）额外转义反斜杠，避免 Doris 把 \\d 当作转义序列。 */
+    private static String escapedStringLiteral(String value) {
+        String escaped = value == null ? "" : value.replace("\\", "\\\\").replace("'", "''");
+        return "'" + escaped + "'";
     }
 
     // ------------------------------------------------------ calculator

@@ -10,6 +10,9 @@ import com.datamodel.dto.FlowUpdateRequest;
 import com.datamodel.dto.FlowUpdateResult;
 import com.datamodel.dto.FlowVO;
 import com.datamodel.dto.IdResult;
+import com.datamodel.dto.LlmKeyRequest;
+import com.datamodel.dto.LlmKeyStatus;
+import com.datamodel.dto.LlmModelsResponse;
 import com.datamodel.dto.NodeDataPreviewRequest;
 import com.datamodel.dto.NodeDataPreviewResponse;
 import com.datamodel.dto.SqlPreviewRequest;
@@ -18,6 +21,8 @@ import com.datamodel.service.FlowRunService;
 import com.datamodel.service.FlowService;
 import com.datamodel.service.NodeDataService;
 import com.datamodel.service.NodeSqlService;
+import com.datamodel.service.llm.LlmCredentialService;
+import com.datamodel.service.llm.LlmModelService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -41,13 +46,19 @@ public class FlowController {
     private final NodeSqlService nodeSqlService;
     private final NodeDataService nodeDataService;
     private final FlowRunService flowRunService;
+    private final LlmCredentialService llmCredentialService;
+    private final LlmModelService llmModelService;
 
     public FlowController(FlowService flowService, NodeSqlService nodeSqlService,
-                          NodeDataService nodeDataService, FlowRunService flowRunService) {
+                          NodeDataService nodeDataService, FlowRunService flowRunService,
+                          LlmCredentialService llmCredentialService,
+                          LlmModelService llmModelService) {
         this.flowService = flowService;
         this.nodeSqlService = nodeSqlService;
         this.nodeDataService = nodeDataService;
         this.flowRunService = flowRunService;
+        this.llmCredentialService = llmCredentialService;
+        this.llmModelService = llmModelService;
     }
 
     @GetMapping
@@ -134,6 +145,38 @@ public class FlowController {
             @PathVariable String nodeId,
             @RequestBody(required = false) NodeDataPreviewRequest request) {
         return ApiResponse.ok(nodeDataService.preview(id, nodeId, request));
+    }
+
+    /** 大模型节点 Key 状态：只回 hasKey + mask。 */
+    @GetMapping("/{id}/node/{nodeId}/llm-key")
+    public ApiResponse<LlmKeyStatus> llmKeyStatus(@PathVariable Long id,
+                                                  @PathVariable String nodeId) {
+        return ApiResponse.ok(llmCredentialService.status(id, nodeId));
+    }
+
+    /** 设置/替换大模型 Key；响应只回掩码。 */
+    @PutMapping("/{id}/node/{nodeId}/llm-key")
+    public ApiResponse<LlmKeyStatus> putLlmKey(@PathVariable Long id,
+                                               @PathVariable String nodeId,
+                                               @RequestBody(required = false) LlmKeyRequest request) {
+        return ApiResponse.ok(llmCredentialService.put(id, nodeId,
+                request == null ? null : request.getApiKey()));
+    }
+
+    /** 删除大模型 Key；幂等。 */
+    @DeleteMapping("/{id}/node/{nodeId}/llm-key")
+    public ApiResponse<LlmKeyStatus> deleteLlmKey(@PathVariable Long id,
+                                                  @PathVariable String nodeId) {
+        return ApiResponse.ok(llmCredentialService.delete(id, nodeId));
+    }
+
+    /** 模型列表：用该节点已保存的 Key 拉 GET {base}/models；失败为中文原因。 */
+    @GetMapping("/{id}/node/{nodeId}/llm-models")
+    public ApiResponse<LlmModelsResponse> llmModels(@PathVariable Long id,
+                                                    @PathVariable String nodeId,
+                                                    @RequestParam(value = "endpoint", required = false)
+                                                            String endpoint) {
+        return ApiResponse.ok(llmModelService.list(id, nodeId, endpoint));
     }
 
     @GetMapping("/{id}/runs")

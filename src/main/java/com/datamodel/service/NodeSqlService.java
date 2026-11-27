@@ -62,7 +62,19 @@ public class NodeSqlService {
             throw new BizException(ErrorCode.DAG_INVALID, "画布尚未保存");
         }
 
-        SqlBuildResult built = sqlBuilderFactory.build(dagJson, flowId, nodeId);
+        SqlBuildResult built;
+        try {
+            built = sqlBuilderFactory.build(dagJson, flowId, nodeId);
+        } catch (BizException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            log.error("生成节点 SQL 预览失败 flow={} node={}", flowId, nodeId, e);
+            java.util.Map<String, Object> data = new java.util.LinkedHashMap<>();
+            data.put("nodeId", nodeId);
+            data.put("reason", "PREVIEW_SQL_BUILD_FAILED");
+            throw new BizException(ErrorCode.PARAM_ERROR,
+                    "预览失败：节点配置无法生成 SQL，请检查该节点的配置（节点 " + nodeId + "）", data);
+        }
 
         Set<String> missing = new LinkedHashSet<>(built.getUpstreamMissing());
         missing.addAll(notMaterializedUpstream(dagJson, flowId, nodeId));

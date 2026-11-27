@@ -65,6 +65,20 @@ public class RegistryTableInitializer implements ApplicationRunner {
                     + "UNIQUE (flow_id, node_id, target_key)"
                     + ")";
 
+    /** api_key_enc 用 TEXT：4096 字符 Key 的密文约 5.5KB，VARCHAR(1024) 不够。 */
+    private static final String LLM_CREDENTIAL_DDL =
+            "CREATE TABLE IF NOT EXISTS data_model_llm_credential ("
+                    + "id BIGINT AUTO_INCREMENT PRIMARY KEY,"
+                    + "flow_id BIGINT NOT NULL,"
+                    + "node_id VARCHAR(64) NOT NULL,"
+                    + "api_key_enc TEXT NOT NULL,"
+                    + "key_mask VARCHAR(64) NOT NULL,"
+                    + "create_time DATETIME NOT NULL,"
+                    + "update_time DATETIME NOT NULL,"
+                    + "UNIQUE KEY uk_llm_credential (flow_id, node_id),"
+                    + "KEY idx_llm_credential_flow (flow_id)"
+                    + ")";
+
     private final JdbcTemplate jdbcTemplate;
     private final DorisProperties props;
 
@@ -81,6 +95,7 @@ public class RegistryTableInitializer implements ApplicationRunner {
         createQuietly("data_model_table_registry", REGISTRY_DDL);
         createQuietly("data_model_sync_log", SYNC_LOG_DDL);
         createQuietly("data_model_sink_watermark", SINK_WATERMARK_DDL);
+        createQuietly("data_model_llm_credential", LLM_CREDENTIAL_DDL);
     }
 
     private void createQuietly(String name, String ddl) {

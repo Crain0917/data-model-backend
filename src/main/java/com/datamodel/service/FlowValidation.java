@@ -109,6 +109,43 @@ public final class FlowValidation {
         topologicalOrder(Dag.parse(dagJson), ids);
     }
 
+    /**
+     * 保存画布时的配置结构校验：只拦截结构性必填项为空，不做依赖上游字段的语义校验，
+     * 也不扩大到 llm 等允许未填完的算子（这些算子保存宽松、运行严格）。
+     */
+    public static void validateSaveConfig(JsonNode dagJson) {
+        if (dagJson == null || !dagJson.has("nodes") || !dagJson.get("nodes").isArray()) {
+            return;
+        }
+        for (JsonNode n : dagJson.get("nodes")) {
+            DagNode node = DagNode.from(n);
+            String id = node.id() == null ? "" : node.id().trim();
+            if ("columns_to_rows".equals(node.type())) {
+                if (node.text("nameOutput", "").trim().isEmpty()) {
+                    throw invalid(id, "COLUMNS_TO_ROWS_OUTPUT_EMPTY",
+                            "列转行的名称列不能为空，请填写后再保存（节点 " + id + "）");
+                }
+                if (node.text("valueOutput", "").trim().isEmpty()) {
+                    throw invalid(id, "COLUMNS_TO_ROWS_OUTPUT_EMPTY",
+                            "列转行的值列不能为空，请填写后再保存（节点 " + id + "）");
+                }
+            } else if ("rows_to_columns".equals(node.type())) {
+                JsonNode pivotValues = node.array("pivotValues");
+                if (pivotValues != null) {
+                    int index = 0;
+                    for (JsonNode v : pivotValues) {
+                        index++;
+                        if (v.path("output").asText("").trim().isEmpty()) {
+                            throw invalid(id, "ROWS_TO_COLUMNS_OUTPUT_EMPTY",
+                                    "行转列第 " + index + " 个透视列的输出名不能为空，请填写后再保存（节点 "
+                                            + id + "）");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /** 目标节点及其全部上游的拓扑顺序；目标节点最后执行。 */
     public static List<String> executionOrder(Dag dag, String targetNodeId) {
         Set<String> subset = new LinkedHashSet<>();
@@ -170,6 +207,7 @@ public final class FlowValidation {
                 || "split_fields".equals(type) || "split_fields_to_rows".equals(type)
                 || "value_mapper".equals(type) || "unique_rows".equals(type)
                 || "columns_to_rows".equals(type) || "rows_to_columns".equals(type)
+                || "replace_in_string".equals(type) || "llm".equals(type)
                 || "sink".equals(type);
     }
 

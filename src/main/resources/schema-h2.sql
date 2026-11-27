@@ -46,3 +46,14 @@ CREATE TABLE IF NOT EXISTS data_model_sink_watermark (
   update_time      DATETIME     NOT NULL,
   CONSTRAINT uk_sink_watermark UNIQUE (flow_id, node_id, target_key)
 );
+
+CREATE TABLE IF NOT EXISTS data_model_llm_credential (
+  id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+  flow_id     BIGINT      NOT NULL,
+  node_id     VARCHAR(64) NOT NULL,
+  api_key_enc CLOB        NOT NULL,
+  key_mask    VARCHAR(64) NOT NULL,
+  create_time DATETIME    NOT NULL,
+  update_time DATETIME    NOT NULL,
+  CONSTRAINT uk_llm_credential UNIQUE (flow_id, node_id)
+);

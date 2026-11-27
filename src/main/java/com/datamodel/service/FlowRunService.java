@@ -31,6 +31,7 @@ import com.datamodel.service.doris.SourceSyncService;
 import com.datamodel.service.doris.MaterializeService;
 import com.datamodel.service.doris.SinkWatermarkRepository;
 import com.datamodel.service.doris.SyncResult;
+import com.datamodel.service.llm.LlmExecuteService;
 import com.datamodel.sink.SinkConfig;
 import com.datamodel.sink.SinkField;
 import com.datamodel.sink.SinkProgress;
@@ -79,6 +80,7 @@ public class FlowRunService {
     private final DorisRegistryRepository registryRepository;
     private final DorisClient dorisClient;
     private final DorisNameSanitizer nameSanitizer;
+    private final LlmExecuteService llmExecuteService;
     private final ExecutorService executor;
 
     private final Set<Long> runningFlows = ConcurrentHashMap.newKeySet();
@@ -98,6 +100,7 @@ public class FlowRunService {
                           DorisRegistryRepository registryRepository,
                           DorisClient dorisClient,
                           DorisNameSanitizer nameSanitizer,
+                          LlmExecuteService llmExecuteService,
                           @Qualifier("flowRunExecutor") ExecutorService executor) {
         this.flowService = flowService;
         this.flowMapper = flowMapper;
@@ -114,6 +117,7 @@ public class FlowRunService {
         this.registryRepository = registryRepository;
         this.dorisClient = dorisClient;
         this.nameSanitizer = nameSanitizer;
+        this.llmExecuteService = llmExecuteService;
         this.executor = executor;
     }
 
@@ -333,6 +337,8 @@ public class FlowRunService {
                 runSource(run, node, nr);
             } else if ("sink".equals(node.type())) {
                 runSink(run, dagJson, node, nr, reuseUpstream);
+            } else if ("llm".equals(node.type())) {
+                runLlm(run, dagJson, node, nr);
             } else {
                 runMaterialize(run, dagJson, node, nr);
             }
@@ -446,6 +452,26 @@ public class FlowRunService {
         }
         writeLog(run.getId(), node.id(), "INFO",
                 "物化完成 → " + result.getTargetTable() + "，输出行数 " + result.getRows());
+    }
+
+    /**
+     * 大模型节点：分批真实调用模型，结果写映射表后一次性 JOIN 物化；
+     * 任何一批失败节点即失败，节点表保持上一次成功结果（无部分结果）。
+     */
+    private void runLlm(FlowRunEntity run, JsonNode dagJson, DagNode node, NodeRunEntity nr) {
+        LlmExecuteService.LlmRunResult result = llmExecuteService.run(dagJson, run.getFlowId(), node,
+                (level, message) -> writeLog(run.getId(), node.id(), level, message));
+        nr.setRowCount(result.rows());
+        nr.setTargetTable(result.targetTable());
+        nr.setSqlText(result.sqlText());
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("batches", result.batches());
+        params.put("calls", result.calls());
+        nr.setParams(JsonUtils.toJson(params));
+        if (result.recreated()) {
+            writeLog(run.getId(), node.id(), "WARN",
+                    "表结构变更，已重建中间表 " + result.targetTable());
+        }
     }
 
     private static boolean uniqueWithDuplicateTable(DagNode node) {

@@ -66,6 +66,14 @@ app:
     query-timeout-seconds: ${DS_QUERY_TIMEOUT_SECONDS:10}
   cors:
     allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173,http://127.0.0.1:5173,http://localhost:5175,http://127.0.0.1:5175}
+  llm:
+    # 默认仅允许公网 https；内网自建模型需显式开启并加入 host[:port] 白名单
+    allow-private-endpoints: ${LLM_ALLOW_PRIVATE_ENDPOINTS:false}
+    allowed-hosts: ${LLM_ALLOWED_HOSTS:}
+    max-input-chars: ${LLM_MAX_INPUT_CHARS:24000}
+    temp-table-retain-hours: ${LLM_TEMP_TABLE_RETAIN_HOURS:24}
+    preview-max-rows: ${LLM_PREVIEW_MAX_ROWS:20}
+    preview-timeout-seconds: ${LLM_PREVIEW_TIMEOUT_SECONDS:30}
 
 logging:
   level:

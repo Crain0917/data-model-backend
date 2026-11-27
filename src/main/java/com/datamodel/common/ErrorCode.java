@@ -21,7 +21,8 @@ public enum ErrorCode {
     INTERNAL_ERROR(5000, 500, "内部错误"),
     DORIS_EXEC_FAILED(5001, 500, "Doris 执行失败"),
     DRIVER_ERROR(5002, 500, "数据源驱动/连接错误"),
-    SINK_WRITE_FAILED(5003, 500, "Sink 写入失败");
+    SINK_WRITE_FAILED(5003, 500, "Sink 写入失败"),
+    LLM_ERROR(5010, 500, "大模型调用失败");
 
     private final int code;
     private final int httpStatus;

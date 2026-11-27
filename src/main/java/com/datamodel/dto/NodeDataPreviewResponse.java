@@ -18,6 +18,9 @@ public class NodeDataPreviewResponse {
     /** Sink 节点附带的写入元信息；不触发任何写入。 */
     @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_EMPTY)
     private Map<String, Object> sink = new LinkedHashMap<>();
+    /** 大模型节点预览元信息：是否真实调用了模型等。 */
+    @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_EMPTY)
+    private Map<String, Object> llm = new LinkedHashMap<>();
 
     public List<ColumnInfo> getColumns() {
         return columns;
@@ -81,5 +84,13 @@ public class NodeDataPreviewResponse {
 
     public void setSink(Map<String, Object> sink) {
         this.sink = sink == null ? new LinkedHashMap<>() : sink;
+    }
+
+    public Map<String, Object> getLlm() {
+        return llm;
+    }
+
+    public void setLlm(Map<String, Object> llm) {
+        this.llm = llm == null ? new LinkedHashMap<>() : llm;
     }
 }
